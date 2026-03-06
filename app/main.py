@@ -52,25 +52,56 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
     return downloaded_files[0]
 
 
+def guess_content_type(audio_path: Path) -> str:
+    ext = audio_path.suffix.lower()
+
+    if ext == ".mp3":
+        return "audio/mpeg"
+    if ext == ".mp4" or ext == ".m4a":
+        return "audio/mp4"
+    if ext == ".webm":
+        return "audio/webm"
+    if ext == ".wav":
+        return "audio/wav"
+    if ext == ".ogg":
+        return "audio/ogg"
+
+    return "application/octet-stream"
+
+
 async def transcribe_with_deepgram(audio_path: Path) -> dict:
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY não configurada.")
 
+    content_type = guess_content_type(audio_path)
+    file_size = audio_path.stat().st_size
+
+    if file_size == 0:
+        raise RuntimeError("Arquivo de áudio vazio.")
+
     headers = {
         "Authorization": f"Token {DEEPGRAM_API_KEY}",
-        "Content-Type": "application/octet-stream",
+        "Content-Type": content_type,
     }
 
     async with httpx.AsyncClient(timeout=600.0) as client:
         with open(audio_path, "rb") as f:
-            response = await client.post(
-                DEEPGRAM_URL,
-                headers=headers,
-                content=f.read(),
-            )
+            audio_bytes = f.read()
+
+        response = await client.post(
+            DEEPGRAM_URL,
+            headers=headers,
+            content=audio_bytes,
+        )
 
     if response.status_code >= 400:
-        raise RuntimeError(f"HTTP Error {response.status_code}: {response.text}")
+        raise RuntimeError(
+            f"Deepgram HTTP {response.status_code} | "
+            f"content_type={content_type} | "
+            f"file={audio_path.name} | "
+            f"size={file_size} bytes | "
+            f"body={response.text}"
+        )
 
     return response.json()
 
@@ -115,6 +146,7 @@ async def transcript(payload: TranscriptRequest):
                 "has_transcript": len(segments) > 0,
                 "job_id": payload.job_id,
                 "video_id": payload.video_id,
+                "downloaded_file": audio_path.name,
                 "segments": segments,
             }
 
