@@ -57,9 +57,8 @@ async def transcribe_with_deepgram(audio_path: Path) -> dict:
         raise RuntimeError("DEEPGRAM_API_KEY não configurada.")
 
     headers = {
-    "Authorization": f"Token {DEEPGRAM_API_KEY}",
-    "Content-Type": "application/octet-stream",
-}
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Content-Type": "application/octet-stream",
     }
 
     async with httpx.AsyncClient(timeout=600.0) as client:
@@ -71,7 +70,7 @@ async def transcribe_with_deepgram(audio_path: Path) -> dict:
             )
 
     if response.status_code >= 400:
-        raise RuntimeError(f"Erro Deepgram: {response.status_code} - {response.text}")
+        raise RuntimeError(f"HTTP Error {response.status_code}: {response.text}")
 
     return response.json()
 
