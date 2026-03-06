@@ -1,17 +1,23 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from pathlib import Path
-import subprocess
+from pytube import YouTube
 import tempfile
 import os
 import httpx
 
 app = FastAPI(title="Auction Worker")
 
-
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
-DEEPGRAM_URL = "https://api.deepgram.com/v1/listen?model=nova-2&language=pt-BR&smart_format=true&utterances=true&punctuate=true&numerals=true"
+DEEPGRAM_URL = (
+    "https://api.deepgram.com/v1/listen"
+    "?model=nova-2"
+    "&language=pt-BR"
+    "&smart_format=true"
+    "&utterances=true"
+    "&punctuate=true"
+    "&numerals=true"
+)
 
 
 class TranscriptRequest(BaseModel):
@@ -21,35 +27,29 @@ class TranscriptRequest(BaseModel):
 
 
 def download_audio(video_url: str, output_dir: Path) -> Path:
-    output_template = str(output_dir / "audio.%(ext)s")
+    yt = YouTube(video_url)
 
-    cmd = [
-        "yt-dlp",
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "-o", output_template,
-    ]
+    stream = (
+        yt.streams
+        .filter(only_audio=True)
+        .order_by("abr")
+        .desc()
+        .first()
+    )
 
-    cookies_file = None
+    if not stream:
+        raise RuntimeError("Não foi possível localizar um stream de áudio do vídeo.")
 
-    if YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip():
-        cookies_file = output_dir / "cookies.txt"
-        cookies_file.write_text(YOUTUBE_COOKIES, encoding="utf-8")
-        cmd.extend(["--cookies", str(cookies_file)])
+    stream.download(
+        output_path=str(output_dir),
+        filename="audio"
+    )
 
-    cmd.append(video_url)
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.returncode != 0:
-        raise RuntimeError(f"Erro ao baixar áudio: {result.stderr}")
-
-    mp3_files = list(output_dir.glob("audio.*"))
-    if not mp3_files:
+    downloaded_files = list(output_dir.glob("audio.*"))
+    if not downloaded_files:
         raise RuntimeError("Áudio não encontrado após download.")
 
-    return mp3_files[0]
+    return downloaded_files[0]
 
 
 async def transcribe_with_deepgram(audio_path: Path) -> dict:
