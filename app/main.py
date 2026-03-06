@@ -8,6 +8,8 @@ import httpx
 
 app = FastAPI(title="Auction Worker")
 
+APP_VERSION = "debug-v2"
+
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 DEEPGRAM_URL = (
     "https://api.deepgram.com/v1/listen"
@@ -57,7 +59,7 @@ def guess_content_type(audio_path: Path) -> str:
 
     if ext == ".mp3":
         return "audio/mpeg"
-    if ext == ".mp4" or ext == ".m4a":
+    if ext in [".mp4", ".m4a"]:
         return "audio/mp4"
     if ext == ".webm":
         return "audio/webm"
@@ -129,7 +131,7 @@ def normalize_segments(deepgram_response: dict) -> list[dict]:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.post("/transcript")
@@ -146,6 +148,7 @@ async def transcript(payload: TranscriptRequest):
                 "has_transcript": len(segments) > 0,
                 "job_id": payload.job_id,
                 "video_id": payload.video_id,
+                "version": APP_VERSION,
                 "downloaded_file": audio_path.name,
                 "segments": segments,
             }
@@ -155,5 +158,6 @@ async def transcript(payload: TranscriptRequest):
             "has_transcript": False,
             "job_id": payload.job_id,
             "video_id": payload.video_id,
+            "version": APP_VERSION,
             "error": str(e),
         }
