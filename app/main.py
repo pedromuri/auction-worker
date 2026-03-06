@@ -10,6 +10,7 @@ app = FastAPI(title="Auction Worker")
 
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen?model=nova-2&language=pt-BR&smart_format=true&utterances=true&punctuate=true&numerals=true"
 
 
@@ -28,8 +29,16 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
         "--audio-format", "mp3",
         "--audio-quality", "0",
         "-o", output_template,
-        video_url,
     ]
+
+    cookies_file = None
+
+    if YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip():
+        cookies_file = output_dir / "cookies.txt"
+        cookies_file.write_text(YOUTUBE_COOKIES, encoding="utf-8")
+        cmd.extend(["--cookies", str(cookies_file)])
+
+    cmd.append(video_url)
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
