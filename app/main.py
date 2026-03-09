@@ -31,7 +31,7 @@ JOB_DIR.mkdir(exist_ok=True)
 
 
 class TranscriptRequest(BaseModel):
-     video_url: str
+    video_url: str
     video_id: str
     job_id: str | None = None
 
