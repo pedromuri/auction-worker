@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from pathlib import Path
 import tempfile
@@ -6,10 +6,12 @@ import os
 import httpx
 import subprocess
 import yt_dlp
+import uuid
+import json
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "debug-v4"
+APP_VERSION = "async-v1"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
@@ -23,14 +25,35 @@ DEEPGRAM_URL = (
     "&numerals=true"
 )
 
+# pasta temporária para jobs
+JOB_DIR = Path("/tmp/jobs")
+JOB_DIR.mkdir(exist_ok=True)
+
 
 class TranscriptRequest(BaseModel):
     video_url: str
     video_id: str
-    job_id: str
+    job_id: str | None = None
 
 
-def download_audio(video_url: str, output_dir: Path) -> Path:
+def job_path(job_id: str):
+    return JOB_DIR / f"{job_id}.json"
+
+
+def save_job(job_id: str, data: dict):
+    with open(job_path(job_id), "w") as f:
+        json.dump(data, f)
+
+
+def load_job(job_id: str):
+    path = job_path(job_id)
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def download_audio(video_url: str, output_dir: Path):
 
     output_template = str(output_dir / "audio.%(ext)s")
 
@@ -47,12 +70,12 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
     files = list(output_dir.glob("audio.*"))
 
     if not files:
-        raise RuntimeError("Falha ao baixar áudio com yt-dlp.")
+        raise RuntimeError("Falha ao baixar áudio.")
 
     return files[0]
 
 
-def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
+def convert_to_wav(input_file: Path, output_dir: Path):
 
     output_file = output_dir / "audio.wav"
 
@@ -70,27 +93,19 @@ def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
     )
 
     if result.returncode != 0:
-        raise RuntimeError(f"Erro ffmpeg: {result.stderr}")
-
-    if not output_file.exists():
-        raise RuntimeError("Falha na conversão para WAV.")
+        raise RuntimeError(result.stderr)
 
     return output_file
 
 
-async def transcribe_with_deepgram(audio_path: Path) -> dict:
-
-    if not DEEPGRAM_API_KEY:
-        raise RuntimeError("DEEPGRAM_API_KEY não configurada.")
-
-    file_size = audio_path.stat().st_size
+async def transcribe_with_deepgram(audio_path: Path):
 
     headers = {
         "Authorization": f"Token {DEEPGRAM_API_KEY}",
         "Content-Type": "audio/wav",
     }
 
-    async with httpx.AsyncClient(timeout=600.0) as client:
+    async with httpx.AsyncClient(timeout=600) as client:
 
         with open(audio_path, "rb") as f:
             audio_bytes = f.read()
@@ -98,20 +113,16 @@ async def transcribe_with_deepgram(audio_path: Path) -> dict:
         response = await client.post(
             DEEPGRAM_URL,
             headers=headers,
-            content=audio_bytes,
+            content=audio_bytes
         )
 
     if response.status_code >= 400:
-        raise RuntimeError(
-            f"Deepgram HTTP {response.status_code} | "
-            f"size={file_size} bytes | "
-            f"body={response.text}"
-        )
+        raise RuntimeError(response.text)
 
     return response.json()
 
 
-def normalize_segments(deepgram_response: dict):
+def normalize_segments(deepgram_response):
 
     results = deepgram_response.get("results", {})
     utterances = results.get("utterances", [])
@@ -125,15 +136,47 @@ def normalize_segments(deepgram_response: dict):
         if not text:
             continue
 
-        segments.append(
-            {
-                "start": utt.get("start"),
-                "end": utt.get("end"),
-                "text": text,
-            }
-        )
+        segments.append({
+            "start": utt.get("start"),
+            "end": utt.get("end"),
+            "text": text
+        })
 
     return segments
+
+
+async def process_job(job_id: str, video_url: str, video_id: str):
+
+    try:
+
+        save_job(job_id, {"status": "processing"})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+
+            tmp = Path(tmpdir)
+
+            downloaded = download_audio(video_url, tmp)
+            wav = convert_to_wav(downloaded, tmp)
+
+            deepgram = await transcribe_with_deepgram(wav)
+
+            segments = normalize_segments(deepgram)
+
+            result = {
+                "status": "finished",
+                "has_transcript": True,
+                "video_id": video_id,
+                "segments": segments
+            }
+
+            save_job(job_id, result)
+
+    except Exception as e:
+
+        save_job(job_id, {
+            "status": "failed",
+            "error": str(e)
+        })
 
 
 @app.get("/health")
@@ -144,46 +187,49 @@ async def health():
     }
 
 
-@app.post("/transcript")
-async def transcript(payload: TranscriptRequest):
+@app.post("/transcript/start")
+async def transcript_start(payload: TranscriptRequest, background_tasks: BackgroundTasks):
 
-    downloaded_name = None
-    wav_name = None
+    job_id = payload.job_id or str(uuid.uuid4())
 
-    try:
+    save_job(job_id, {"status": "queued"})
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+    background_tasks.add_task(
+        process_job,
+        job_id,
+        payload.video_url,
+        payload.video_id
+    )
 
-            tmp_path = Path(tmpdir)
+    return {
+        "job_id": job_id,
+        "status": "queued"
+    }
 
-            downloaded_audio = download_audio(payload.video_url, tmp_path)
-            downloaded_name = downloaded_audio.name
 
-            wav_audio = convert_to_wav(downloaded_audio, tmp_path)
-            wav_name = wav_audio.name
+@app.get("/transcript/status/{job_id}")
+async def transcript_status(job_id: str):
 
-            deepgram_response = await transcribe_with_deepgram(wav_audio)
+    job = load_job(job_id)
 
-            segments = normalize_segments(deepgram_response)
+    if not job:
+        return {"status": "not_found"}
 
-            return {
-                "has_transcript": len(segments) > 0,
-                "job_id": payload.job_id,
-                "video_id": payload.video_id,
-                "version": APP_VERSION,
-                "downloaded_file": downloaded_name,
-                "wav_file": wav_name,
-                "segments": segments,
-            }
+    return {
+        "job_id": job_id,
+        "status": job["status"]
+    }
 
-    except Exception as e:
 
-        return {
-            "has_transcript": False,
-            "job_id": payload.job_id,
-            "video_id": payload.video_id,
-            "version": APP_VERSION,
-            "downloaded_file": downloaded_name,
-            "wav_file": wav_name,
-            "error": str(e),
-        }
+@app.get("/transcript/result/{job_id}")
+async def transcript_result(job_id: str):
+
+    job = load_job(job_id)
+
+    if not job:
+        return {"status": "not_found"}
+
+    if job["status"] != "finished":
+        return {"status": job["status"]}
+
+    return job
