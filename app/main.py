@@ -11,9 +11,10 @@ import json
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v2"
+APP_VERSION = "async-v3"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
 
 DEEPGRAM_URL = (
     "https://api.deepgram.com/v1/listen"
@@ -30,7 +31,7 @@ JOB_DIR.mkdir(exist_ok=True)
 
 
 class TranscriptRequest(BaseModel):
-    video_url: str
+     video_url: str
     video_id: str
     job_id: str | None = None
 
@@ -52,15 +53,35 @@ def load_job(job_id: str):
         return json.load(f)
 
 
+def write_cookies_file(output_dir: Path) -> Path | None:
+    if not YOUTUBE_COOKIES or not YOUTUBE_COOKIES.strip():
+        return None
+
+    cookie_file = output_dir / "cookies.txt"
+    cookie_file.write_text(YOUTUBE_COOKIES, encoding="utf-8")
+    return cookie_file
+
+
 def download_audio(video_url: str, output_dir: Path):
     output_template = str(output_dir / "audio.%(ext)s")
+    cookie_file = write_cookies_file(output_dir)
 
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": output_template,
         "quiet": True,
         "noplaylist": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
+        },
     }
+
+    if cookie_file:
+        ydl_opts["cookiefile"] = str(cookie_file)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
