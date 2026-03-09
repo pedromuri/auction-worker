@@ -5,6 +5,7 @@ from pytube import YouTube
 import tempfile
 import os
 import httpx
+import subprocess
 
 app = FastAPI(title="Auction Worker")
 
@@ -54,36 +55,40 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
     return downloaded_files[0]
 
 
-def guess_content_type(audio_path: Path) -> str:
-    ext = audio_path.suffix.lower()
+def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
+    output_file = output_dir / "audio.wav"
 
-    if ext == ".mp3":
-        return "audio/mpeg"
-    if ext in [".mp4", ".m4a"]:
-        return "audio/mp4"
-    if ext == ".webm":
-        return "audio/webm"
-    if ext == ".wav":
-        return "audio/wav"
-    if ext == ".ogg":
-        return "audio/ogg"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", str(input_file),
+            "-ar", "16000",
+            "-ac", "1",
+            str(output_file)
+        ],
+        capture_output=True,
+        text=True,
+        check=True
+    )
 
-    return "application/octet-stream"
+    if not output_file.exists():
+        raise RuntimeError("Falha na conversão para WAV.")
+
+    return output_file
 
 
 async def transcribe_with_deepgram(audio_path: Path) -> dict:
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY não configurada.")
 
-    content_type = guess_content_type(audio_path)
     file_size = audio_path.stat().st_size
-
     if file_size == 0:
-        raise RuntimeError("Arquivo de áudio vazio.")
+        raise RuntimeError("Arquivo WAV vazio.")
 
     headers = {
         "Authorization": f"Token {DEEPGRAM_API_KEY}",
-        "Content-Type": content_type,
+        "Content-Type": "audio/wav",
     }
 
     async with httpx.AsyncClient(timeout=600.0) as client:
@@ -99,7 +104,6 @@ async def transcribe_with_deepgram(audio_path: Path) -> dict:
     if response.status_code >= 400:
         raise RuntimeError(
             f"Deepgram HTTP {response.status_code} | "
-            f"content_type={content_type} | "
             f"file={audio_path.name} | "
             f"size={file_size} bytes | "
             f"body={response.text}"
@@ -140,8 +144,10 @@ async def transcript(payload: TranscriptRequest):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
 
-            audio_path = download_audio(payload.video_url, tmp_path)
-            deepgram_response = await transcribe_with_deepgram(audio_path)
+            downloaded_audio = download_audio(payload.video_url, tmp_path)
+            wav_audio = convert_to_wav(downloaded_audio, tmp_path)
+
+            deepgram_response = await transcribe_with_deepgram(wav_audio)
             segments = normalize_segments(deepgram_response)
 
             return {
@@ -149,7 +155,8 @@ async def transcript(payload: TranscriptRequest):
                 "job_id": payload.job_id,
                 "video_id": payload.video_id,
                 "version": APP_VERSION,
-                "downloaded_file": audio_path.name,
+                "downloaded_file": downloaded_audio.name,
+                "wav_file": wav_audio.name,
                 "segments": segments,
             }
 
