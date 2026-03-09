@@ -9,7 +9,7 @@ import subprocess
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "debug-v2"
+APP_VERSION = "debug-v3"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 DEEPGRAM_URL = (
@@ -58,7 +58,7 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
 def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
     output_file = output_dir / "audio.wav"
 
-    subprocess.run(
+    result = subprocess.run(
         [
             "ffmpeg",
             "-y",
@@ -68,9 +68,11 @@ def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
             str(output_file)
         ],
         capture_output=True,
-        text=True,
-        check=True
+        text=True
     )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Erro ffmpeg: {result.stderr}")
 
     if not output_file.exists():
         raise RuntimeError("Falha na conversão para WAV.")
@@ -140,12 +142,18 @@ async def health():
 
 @app.post("/transcript")
 async def transcript(payload: TranscriptRequest):
+    downloaded_name = None
+    wav_name = None
+
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
 
             downloaded_audio = download_audio(payload.video_url, tmp_path)
+            downloaded_name = downloaded_audio.name
+
             wav_audio = convert_to_wav(downloaded_audio, tmp_path)
+            wav_name = wav_audio.name
 
             deepgram_response = await transcribe_with_deepgram(wav_audio)
             segments = normalize_segments(deepgram_response)
@@ -155,8 +163,8 @@ async def transcript(payload: TranscriptRequest):
                 "job_id": payload.job_id,
                 "video_id": payload.video_id,
                 "version": APP_VERSION,
-                "downloaded_file": downloaded_audio.name,
-                "wav_file": wav_audio.name,
+                "downloaded_file": downloaded_name,
+                "wav_file": wav_name,
                 "segments": segments,
             }
 
@@ -166,5 +174,7 @@ async def transcript(payload: TranscriptRequest):
             "job_id": payload.job_id,
             "video_id": payload.video_id,
             "version": APP_VERSION,
+            "downloaded_file": downloaded_name,
+            "wav_file": wav_name,
             "error": str(e),
         }
