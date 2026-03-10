@@ -11,7 +11,7 @@ import json
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v5"
+APP_VERSION = "async-v6"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -76,6 +76,13 @@ def build_ydl_opts(output_template: str, cookie_file: Path | None, format_select
         "noplaylist": True,
         "restrictfilenames": True,
         "nocheckcertificate": True,
+        "js_runtimes": {"deno": "/usr/local/.deno/bin/deno"},
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["default"]
+            }
+        },
+        "remote_components": ["ejs:npm"],
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -109,7 +116,7 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
     format_attempts = [
         "bestaudio/best",
         "bestaudio*",
-        "best",
+        "best"
     ]
 
     errors = []
@@ -252,11 +259,14 @@ async def process_job(job_id: str, video_url: str, video_id: str):
 
 @app.get("/health")
 async def health():
+    deno_path = "/usr/local/.deno/bin/deno"
+
     return {
         "status": "ok",
         "version": APP_VERSION,
         "cookies_env_configured": bool(YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip()),
         "cookies_file_exists": FALLBACK_COOKIES_FILE.exists(),
+        "deno_exists": Path(deno_path).exists(),
     }
 
 
