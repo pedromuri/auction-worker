@@ -11,7 +11,7 @@ import json
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v4"
+APP_VERSION = "async-v5"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -57,12 +57,6 @@ def load_job(job_id: str):
 
 
 def write_cookies_file(output_dir: Path) -> Path | None:
-    """
-    Prioridade:
-    1) variável de ambiente YOUTUBE_COOKIES
-    2) arquivo /app/cookies.txt
-    3) nenhum cookie
-    """
     if YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip():
         cookie_file = output_dir / "cookies.txt"
         cookie_file.write_text(YOUTUBE_COOKIES, encoding="utf-8")
@@ -74,15 +68,14 @@ def write_cookies_file(output_dir: Path) -> Path | None:
     return None
 
 
-def download_audio(video_url: str, output_dir: Path) -> Path:
-    output_template = str(output_dir / "audio.%(ext)s")
-    cookie_file = write_cookies_file(output_dir)
-
+def build_ydl_opts(output_template: str, cookie_file: Path | None, format_selector: str) -> dict:
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": format_selector,
         "outtmpl": output_template,
         "quiet": True,
         "noplaylist": True,
+        "restrictfilenames": True,
+        "nocheckcertificate": True,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -95,18 +88,50 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
     if cookie_file:
         ydl_opts["cookiefile"] = str(cookie_file)
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
-    except Exception as e:
-        raise RuntimeError(f"Erro ao baixar áudio com yt-dlp: {str(e)}")
+    return ydl_opts
 
-    files = list(output_dir.glob("audio.*"))
 
-    if not files:
-        raise RuntimeError("Falha ao baixar áudio: nenhum arquivo foi gerado.")
+def find_downloaded_file(output_dir: Path) -> Path | None:
+    candidates = [
+        p for p in output_dir.iterdir()
+        if p.is_file() and p.name.startswith("audio.")
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+    return candidates[0]
 
-    return files[0]
+
+def download_audio(video_url: str, output_dir: Path) -> Path:
+    output_template = str(output_dir / "audio.%(ext)s")
+    cookie_file = write_cookies_file(output_dir)
+
+    format_attempts = [
+        "bestaudio/best",
+        "bestaudio*",
+        "best",
+    ]
+
+    errors = []
+
+    for format_selector in format_attempts:
+        try:
+            ydl_opts = build_ydl_opts(output_template, cookie_file, format_selector)
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+
+            downloaded = find_downloaded_file(output_dir)
+            if downloaded and downloaded.exists():
+                return downloaded
+
+            errors.append(f"{format_selector}: download sem arquivo gerado")
+        except Exception as e:
+            errors.append(f"{format_selector}: {str(e)}")
+
+    raise RuntimeError(
+        "Erro ao baixar áudio com yt-dlp. Tentativas: " + " | ".join(errors)
+    )
 
 
 def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
@@ -118,6 +143,7 @@ def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
             "-y",
             "-i",
             str(input_file),
+            "-vn",
             "-ar",
             "16000",
             "-ac",
