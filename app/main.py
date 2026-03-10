@@ -11,7 +11,7 @@ import json
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v3"
+APP_VERSION = "async-v4"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -28,6 +28,9 @@ DEEPGRAM_URL = (
 
 JOB_DIR = Path("/tmp/jobs")
 JOB_DIR.mkdir(exist_ok=True)
+
+ROOT_DIR = Path("/app")
+FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
 
 
 class TranscriptRequest(BaseModel):
@@ -54,15 +57,24 @@ def load_job(job_id: str):
 
 
 def write_cookies_file(output_dir: Path) -> Path | None:
-    if not YOUTUBE_COOKIES or not YOUTUBE_COOKIES.strip():
-        return None
+    """
+    Prioridade:
+    1) variável de ambiente YOUTUBE_COOKIES
+    2) arquivo /app/cookies.txt
+    3) nenhum cookie
+    """
+    if YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip():
+        cookie_file = output_dir / "cookies.txt"
+        cookie_file.write_text(YOUTUBE_COOKIES, encoding="utf-8")
+        return cookie_file
 
-    cookie_file = output_dir / "cookies.txt"
-    cookie_file.write_text(YOUTUBE_COOKIES, encoding="utf-8")
-    return cookie_file
+    if FALLBACK_COOKIES_FILE.exists():
+        return FALLBACK_COOKIES_FILE
+
+    return None
 
 
-def download_audio(video_url: str, output_dir: Path):
+def download_audio(video_url: str, output_dir: Path) -> Path:
     output_template = str(output_dir / "audio.%(ext)s")
     cookie_file = write_cookies_file(output_dir)
 
@@ -83,31 +95,37 @@ def download_audio(video_url: str, output_dir: Path):
     if cookie_file:
         ydl_opts["cookiefile"] = str(cookie_file)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([video_url])
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+    except Exception as e:
+        raise RuntimeError(f"Erro ao baixar áudio com yt-dlp: {str(e)}")
 
     files = list(output_dir.glob("audio.*"))
 
     if not files:
-        raise RuntimeError("Falha ao baixar áudio.")
+        raise RuntimeError("Falha ao baixar áudio: nenhum arquivo foi gerado.")
 
     return files[0]
 
 
-def convert_to_wav(input_file: Path, output_dir: Path):
+def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
     output_file = output_dir / "audio.wav"
 
     result = subprocess.run(
         [
             "ffmpeg",
             "-y",
-            "-i", str(input_file),
-            "-ar", "16000",
-            "-ac", "1",
-            str(output_file)
+            "-i",
+            str(input_file),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            str(output_file),
         ],
         capture_output=True,
-        text=True
+        text=True,
     )
 
     if result.returncode != 0:
@@ -137,7 +155,7 @@ async def transcribe_with_deepgram(audio_path: Path):
         response = await client.post(
             DEEPGRAM_URL,
             headers=headers,
-            content=audio_bytes
+            content=audio_bytes,
         )
 
     if response.status_code >= 400:
@@ -210,7 +228,9 @@ async def process_job(job_id: str, video_url: str, video_id: str):
 async def health():
     return {
         "status": "ok",
-        "version": APP_VERSION
+        "version": APP_VERSION,
+        "cookies_env_configured": bool(YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip()),
+        "cookies_file_exists": FALLBACK_COOKIES_FILE.exists(),
     }
 
 
