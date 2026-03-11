@@ -11,7 +11,7 @@ import json
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v6"
+APP_VERSION = "async-v7"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -31,6 +31,7 @@ JOB_DIR.mkdir(exist_ok=True)
 
 ROOT_DIR = Path("/app")
 FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
+DENO_PATH = Path("/usr/local/bin/deno")
 
 
 class TranscriptRequest(BaseModel):
@@ -76,13 +77,6 @@ def build_ydl_opts(output_template: str, cookie_file: Path | None, format_select
         "noplaylist": True,
         "restrictfilenames": True,
         "nocheckcertificate": True,
-        "js_runtimes": {"deno": "/usr/local/.deno/bin/deno"},
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["default"]
-            }
-        },
-        "remote_components": ["ejs:npm"],
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -90,7 +84,20 @@ def build_ydl_opts(output_template: str, cookie_file: Path | None, format_select
                 "Chrome/122.0.0.0 Safari/537.36"
             )
         },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["default"]
+            }
+        },
+        "remote_components": {"ejs:github"},
     }
+
+    if DENO_PATH.exists():
+        ydl_opts["js_runtimes"] = {
+            "deno": {
+                "path": str(DENO_PATH)
+            }
+        }
 
     if cookie_file:
         ydl_opts["cookiefile"] = str(cookie_file)
@@ -105,6 +112,7 @@ def find_downloaded_file(output_dir: Path) -> Path | None:
     ]
     if not candidates:
         return None
+
     candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
     return candidates[0]
 
@@ -116,7 +124,7 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
     format_attempts = [
         "bestaudio/best",
         "bestaudio*",
-        "best"
+        "best",
     ]
 
     errors = []
@@ -216,7 +224,7 @@ def normalize_segments(deepgram_response):
         segments.append({
             "start": utt.get("start"),
             "end": utt.get("end"),
-            "text": text
+            "text": text,
         })
 
     return segments
@@ -227,7 +235,7 @@ async def process_job(job_id: str, video_url: str, video_id: str):
         save_job(job_id, {
             "job_id": job_id,
             "video_id": video_id,
-            "status": "processing"
+            "status": "processing",
         })
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -245,7 +253,7 @@ async def process_job(job_id: str, video_url: str, video_id: str):
                 "has_transcript": len(segments) > 0,
                 "downloaded_file": downloaded.name,
                 "wav_file": wav.name,
-                "segments": segments
+                "segments": segments,
             })
 
     except Exception as e:
@@ -253,20 +261,19 @@ async def process_job(job_id: str, video_url: str, video_id: str):
             "job_id": job_id,
             "video_id": video_id,
             "status": "failed",
-            "error": str(e)
+            "error": str(e),
         })
 
 
 @app.get("/health")
 async def health():
-    deno_path = "/usr/local/.deno/bin/deno"
-
     return {
         "status": "ok",
         "version": APP_VERSION,
         "cookies_env_configured": bool(YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip()),
         "cookies_file_exists": FALLBACK_COOKIES_FILE.exists(),
-        "deno_exists": Path(deno_path).exists(),
+        "deno_exists": DENO_PATH.exists(),
+        "deno_path": str(DENO_PATH),
     }
 
 
@@ -277,20 +284,20 @@ async def transcript_start(payload: TranscriptRequest, background_tasks: Backgro
     save_job(job_id, {
         "job_id": job_id,
         "video_id": payload.video_id,
-        "status": "queued"
+        "status": "queued",
     })
 
     background_tasks.add_task(
         process_job,
         job_id,
         payload.video_url,
-        payload.video_id
+        payload.video_id,
     )
 
     return {
         "job_id": job_id,
         "status": "queued",
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
 
 
@@ -302,13 +309,13 @@ async def transcript_status(job_id: str):
         return {
             "job_id": job_id,
             "status": "not_found",
-            "version": APP_VERSION
+            "version": APP_VERSION,
         }
 
     return {
         "job_id": job_id,
         "status": job.get("status"),
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
 
 
@@ -320,7 +327,7 @@ async def transcript_result(job_id: str):
         return {
             "job_id": job_id,
             "status": "not_found",
-            "version": APP_VERSION
+            "version": APP_VERSION,
         }
 
     job["version"] = APP_VERSION
