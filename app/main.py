@@ -8,10 +8,11 @@ import subprocess
 import yt_dlp
 import uuid
 import json
+import asyncio
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v7"
+APP_VERSION = "async-v8"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -241,8 +242,8 @@ async def process_job(job_id: str, video_url: str, video_id: str):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
 
-            downloaded = download_audio(video_url, tmp)
-            wav = convert_to_wav(downloaded, tmp)
+            downloaded = await asyncio.to_thread(download_audio, video_url, tmp)
+            wav = await asyncio.to_thread(convert_to_wav, downloaded, tmp)
             deepgram = await transcribe_with_deepgram(wav)
             segments = normalize_segments(deepgram)
 
