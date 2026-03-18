@@ -1,5 +1,5 @@
 from fastapi import FastAPI, BackgroundTasks, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
 import tempfile
@@ -13,7 +13,7 @@ import asyncio
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v9"
+APP_VERSION = "async-v10"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -161,39 +161,6 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
     )
 
 
-def download_video_for_frame(video_url: str, output_dir: Path) -> Path:
-    output_template = str(output_dir / "video.%(ext)s")
-    cookie_file = write_cookies_file(output_dir)
-
-    format_attempts = [
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "bestvideo+bestaudio/best",
-        "best",
-    ]
-
-    errors = []
-
-    for format_selector in format_attempts:
-        try:
-            ydl_opts = build_ydl_opts(output_template, cookie_file, format_selector)
-            ydl_opts["merge_output_format"] = "mp4"
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video_url])
-
-            downloaded = find_downloaded_file(output_dir, "video.")
-            if downloaded and downloaded.exists():
-                return downloaded
-
-            errors.append(f"{format_selector}: download sem arquivo gerado")
-        except Exception as e:
-            errors.append(f"{format_selector}: {str(e)}")
-
-    raise RuntimeError(
-        "Erro ao baixar vídeo para frame com yt-dlp. Tentativas: " + " | ".join(errors)
-    )
-
-
 def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
     output_file = output_dir / "audio.wav"
 
@@ -223,7 +190,11 @@ def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
     return output_file
 
 
-def extract_frame_from_video(input_video: Path, timestamp: float, frame_path: Path):
+def extract_frame_direct(video_url: str, timestamp: float, frame_path: Path):
+    """
+    Extrai um frame diretamente da URL do vídeo via ffmpeg.
+    Esta abordagem é mais leve do que baixar o vídeo inteiro primeiro.
+    """
     result = subprocess.run(
         [
             "ffmpeg",
@@ -231,11 +202,13 @@ def extract_frame_from_video(input_video: Path, timestamp: float, frame_path: Pa
             "-ss",
             str(timestamp),
             "-i",
-            str(input_video),
+            video_url,
             "-frames:v",
             "1",
             "-q:v",
             "2",
+            "-loglevel",
+            "error",
             str(frame_path),
         ],
         capture_output=True,
@@ -243,10 +216,10 @@ def extract_frame_from_video(input_video: Path, timestamp: float, frame_path: Pa
     )
 
     if result.returncode != 0:
-        raise RuntimeError(f"Erro ffmpeg ao extrair frame: {result.stderr}")
+        raise RuntimeError(f"Erro ffmpeg direto: {result.stderr}")
 
     if not frame_path.exists():
-        raise RuntimeError("Falha ao gerar frame.")
+        raise RuntimeError("Frame não foi gerado.")
 
 
 async def transcribe_with_deepgram(audio_path: Path):
@@ -408,20 +381,15 @@ async def transcript_result(job_id: str):
 @app.post("/frame/extract")
 async def frame_extract(payload: FrameRequest, request: Request):
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
+        frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+        frame_path = FRAME_DIR / frame_name
 
-            downloaded_video = await asyncio.to_thread(download_video_for_frame, payload.video_url, tmp)
-
-            frame_name = f"frame_{uuid.uuid4().hex}.jpg"
-            frame_path = FRAME_DIR / frame_name
-
-            await asyncio.to_thread(
-                extract_frame_from_video,
-                downloaded_video,
-                payload.timestamp,
-                frame_path
-            )
+        await asyncio.to_thread(
+            extract_frame_direct,
+            payload.video_url,
+            payload.timestamp,
+            frame_path
+        )
 
         frame_url = str(request.base_url).rstrip("/") + f"/frame/file/{frame_name}"
 
@@ -437,20 +405,30 @@ async def frame_extract(payload: FrameRequest, request: Request):
         }
 
     except Exception as e:
-        return {
-            "status": "failed",
-            "error": str(e),
-            "timestamp": payload.timestamp,
-            "video_url": payload.video_url,
-            "video_id": payload.video_id,
-            "worker_job_id": payload.worker_job_id,
-            "version": APP_VERSION,
-        }
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": str(e),
+                "timestamp": payload.timestamp,
+                "video_url": payload.video_url,
+                "video_id": payload.video_id,
+                "worker_job_id": payload.worker_job_id,
+                "version": APP_VERSION,
+            },
+        )
 
 
 @app.get("/frame/file/{filename}")
 async def frame_file(filename: str):
     path = FRAME_DIR / filename
     if not path.exists():
-        return {"status": "not_found", "filename": filename}
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "not_found",
+                "filename": filename,
+                "version": APP_VERSION,
+            },
+        )
     return FileResponse(path)
