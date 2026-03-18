@@ -13,7 +13,7 @@ import asyncio
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v10"
+APP_VERSION = "async-v11"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -81,10 +81,9 @@ def write_cookies_file(output_dir: Path) -> Path | None:
     return None
 
 
-def build_ydl_opts(output_template: str, cookie_file: Path | None, format_selector: str) -> dict:
+def build_ydl_opts(output_template: str | None, cookie_file: Path | None, format_selector: str) -> dict:
     ydl_opts = {
         "format": format_selector,
-        "outtmpl": output_template,
         "quiet": True,
         "noplaylist": True,
         "restrictfilenames": True,
@@ -103,6 +102,9 @@ def build_ydl_opts(output_template: str, cookie_file: Path | None, format_select
         },
         "remote_components": {"ejs:github"},
     }
+
+    if output_template:
+        ydl_opts["outtmpl"] = output_template
 
     if DENO_PATH.exists():
         ydl_opts["js_runtimes"] = {
@@ -190,11 +192,53 @@ def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
     return output_file
 
 
-def extract_frame_direct(video_url: str, timestamp: float, frame_path: Path):
+def get_video_stream_url(video_url: str, output_dir: Path) -> str:
     """
-    Extrai um frame diretamente da URL do vídeo via ffmpeg.
-    Esta abordagem é mais leve do que baixar o vídeo inteiro primeiro.
+    Usa yt-dlp para resolver a URL real do stream de vídeo.
+    Isso evita passar a página do YouTube diretamente para o ffmpeg.
     """
+    cookie_file = write_cookies_file(output_dir)
+
+    format_attempts = [
+        "bestvideo[ext=mp4]/best[ext=mp4]/bestvideo/best"
+    ]
+
+    errors = []
+
+    for format_selector in format_attempts:
+        try:
+            ydl_opts = build_ydl_opts(None, cookie_file, format_selector)
+            ydl_opts["skip_download"] = True
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+
+            # Caso venha formato único
+            if info.get("url"):
+                return info["url"]
+
+            # Caso venha lista de formatos solicitados
+            requested_formats = info.get("requested_formats") or []
+            for fmt in requested_formats:
+                if fmt.get("url"):
+                    return fmt["url"]
+
+            # Fallback para formatos disponíveis
+            formats = info.get("formats") or []
+            for fmt in reversed(formats):
+                if fmt.get("vcodec") != "none" and fmt.get("url"):
+                    return fmt["url"]
+
+            errors.append(f"{format_selector}: nenhuma stream URL encontrada")
+        except Exception as e:
+            errors.append(f"{format_selector}: {str(e)}")
+
+    raise RuntimeError(
+        "Erro ao resolver stream de vídeo com yt-dlp. Tentativas: " + " | ".join(errors)
+    )
+
+
+def extract_frame_from_stream(stream_url: str, timestamp: float, frame_path: Path):
     result = subprocess.run(
         [
             "ffmpeg",
@@ -202,7 +246,7 @@ def extract_frame_direct(video_url: str, timestamp: float, frame_path: Path):
             "-ss",
             str(timestamp),
             "-i",
-            video_url,
+            stream_url,
             "-frames:v",
             "1",
             "-q:v",
@@ -216,7 +260,7 @@ def extract_frame_direct(video_url: str, timestamp: float, frame_path: Path):
     )
 
     if result.returncode != 0:
-        raise RuntimeError(f"Erro ffmpeg direto: {result.stderr}")
+        raise RuntimeError(f"Erro ffmpeg ao extrair frame: {result.stderr}")
 
     if not frame_path.exists():
         raise RuntimeError("Frame não foi gerado.")
@@ -381,15 +425,24 @@ async def transcript_result(job_id: str):
 @app.post("/frame/extract")
 async def frame_extract(payload: FrameRequest, request: Request):
     try:
-        frame_name = f"frame_{uuid.uuid4().hex}.jpg"
-        frame_path = FRAME_DIR / frame_name
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
 
-        await asyncio.to_thread(
-            extract_frame_direct,
-            payload.video_url,
-            payload.timestamp,
-            frame_path
-        )
+            stream_url = await asyncio.to_thread(
+                get_video_stream_url,
+                payload.video_url,
+                tmp
+            )
+
+            frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+            frame_path = FRAME_DIR / frame_name
+
+            await asyncio.to_thread(
+                extract_frame_from_stream,
+                stream_url,
+                payload.timestamp,
+                frame_path
+            )
 
         frame_url = str(request.base_url).rstrip("/") + f"/frame/file/{frame_name}"
 
