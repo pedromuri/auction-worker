@@ -1,4 +1,5 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pathlib import Path
 import tempfile
@@ -12,7 +13,7 @@ import asyncio
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v8"
+APP_VERSION = "async-v9"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -30,6 +31,9 @@ DEEPGRAM_URL = (
 JOB_DIR = Path("/tmp/jobs")
 JOB_DIR.mkdir(exist_ok=True)
 
+FRAME_DIR = Path("/tmp/frames")
+FRAME_DIR.mkdir(exist_ok=True)
+
 ROOT_DIR = Path("/app")
 FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
 DENO_PATH = Path("/usr/local/bin/deno")
@@ -39,6 +43,13 @@ class TranscriptRequest(BaseModel):
     video_url: str
     video_id: str
     job_id: str | None = None
+
+
+class FrameRequest(BaseModel):
+    video_url: str
+    timestamp: float
+    video_id: str | None = None
+    worker_job_id: str | None = None
 
 
 def job_path(job_id: str) -> Path:
@@ -106,10 +117,10 @@ def build_ydl_opts(output_template: str, cookie_file: Path | None, format_select
     return ydl_opts
 
 
-def find_downloaded_file(output_dir: Path) -> Path | None:
+def find_downloaded_file(output_dir: Path, prefix: str) -> Path | None:
     candidates = [
         p for p in output_dir.iterdir()
-        if p.is_file() and p.name.startswith("audio.")
+        if p.is_file() and p.name.startswith(prefix)
     ]
     if not candidates:
         return None
@@ -137,7 +148,7 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
 
-            downloaded = find_downloaded_file(output_dir)
+            downloaded = find_downloaded_file(output_dir, "audio.")
             if downloaded and downloaded.exists():
                 return downloaded
 
@@ -147,6 +158,39 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
 
     raise RuntimeError(
         "Erro ao baixar áudio com yt-dlp. Tentativas: " + " | ".join(errors)
+    )
+
+
+def download_video_for_frame(video_url: str, output_dir: Path) -> Path:
+    output_template = str(output_dir / "video.%(ext)s")
+    cookie_file = write_cookies_file(output_dir)
+
+    format_attempts = [
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "bestvideo+bestaudio/best",
+        "best",
+    ]
+
+    errors = []
+
+    for format_selector in format_attempts:
+        try:
+            ydl_opts = build_ydl_opts(output_template, cookie_file, format_selector)
+            ydl_opts["merge_output_format"] = "mp4"
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+
+            downloaded = find_downloaded_file(output_dir, "video.")
+            if downloaded and downloaded.exists():
+                return downloaded
+
+            errors.append(f"{format_selector}: download sem arquivo gerado")
+        except Exception as e:
+            errors.append(f"{format_selector}: {str(e)}")
+
+    raise RuntimeError(
+        "Erro ao baixar vídeo para frame com yt-dlp. Tentativas: " + " | ".join(errors)
     )
 
 
@@ -177,6 +221,32 @@ def convert_to_wav(input_file: Path, output_dir: Path) -> Path:
         raise RuntimeError("Falha na conversão para WAV.")
 
     return output_file
+
+
+def extract_frame_from_video(input_video: Path, timestamp: float, frame_path: Path):
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(timestamp),
+            "-i",
+            str(input_video),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(frame_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Erro ffmpeg ao extrair frame: {result.stderr}")
+
+    if not frame_path.exists():
+        raise RuntimeError("Falha ao gerar frame.")
 
 
 async def transcribe_with_deepgram(audio_path: Path):
@@ -333,3 +403,54 @@ async def transcript_result(job_id: str):
 
     job["version"] = APP_VERSION
     return job
+
+
+@app.post("/frame/extract")
+async def frame_extract(payload: FrameRequest, request: Request):
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            downloaded_video = await asyncio.to_thread(download_video_for_frame, payload.video_url, tmp)
+
+            frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+            frame_path = FRAME_DIR / frame_name
+
+            await asyncio.to_thread(
+                extract_frame_from_video,
+                downloaded_video,
+                payload.timestamp,
+                frame_path
+            )
+
+        frame_url = str(request.base_url).rstrip("/") + f"/frame/file/{frame_name}"
+
+        return {
+            "status": "ok",
+            "frame_file": frame_name,
+            "frame_url": frame_url,
+            "timestamp": payload.timestamp,
+            "video_url": payload.video_url,
+            "video_id": payload.video_id,
+            "worker_job_id": payload.worker_job_id,
+            "version": APP_VERSION,
+        }
+
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": str(e),
+            "timestamp": payload.timestamp,
+            "video_url": payload.video_url,
+            "video_id": payload.video_id,
+            "worker_job_id": payload.worker_job_id,
+            "version": APP_VERSION,
+        }
+
+
+@app.get("/frame/file/{filename}")
+async def frame_file(filename: str):
+    path = FRAME_DIR / filename
+    if not path.exists():
+        return {"status": "not_found", "filename": filename}
+    return FileResponse(path)
