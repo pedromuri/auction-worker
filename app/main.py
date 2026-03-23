@@ -52,6 +52,16 @@ class FrameRequest(BaseModel):
     worker_job_id: str | None = None
 
 
+class FrameBatchRequest(BaseModel):
+    video_url: str
+    video_id: str | None = None
+    worker_job_id: str | None = None
+    start_time: float = 0
+    end_time: float | None = None
+    interval_seconds: float = 15
+    max_frames: int = 80
+
+
 def job_path(job_id: str) -> Path:
     return JOB_DIR / f"{job_id}.json"
 
@@ -266,6 +276,62 @@ def extract_frame_from_stream(stream_url: str, timestamp: float, frame_path: Pat
         raise RuntimeError("Frame não foi gerado.")
 
 
+def get_stream_duration_seconds(stream_url: str) -> float | None:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            stream_url,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        return float((result.stdout or "").strip())
+    except Exception:
+        return None
+
+
+def build_frame_timestamps(
+    *,
+    duration_seconds: float | None,
+    start_time: float,
+    end_time: float | None,
+    interval_seconds: float,
+    max_frames: int,
+) -> list[float]:
+    safe_interval = max(1.0, float(interval_seconds or 15))
+    safe_max_frames = max(1, min(int(max_frames or 80), 300))
+    safe_start = max(0.0, float(start_time or 0))
+
+    effective_end = end_time
+    if effective_end is None and duration_seconds is not None:
+        effective_end = duration_seconds
+
+    if effective_end is not None:
+        effective_end = max(safe_start, float(effective_end))
+
+    timestamps: list[float] = []
+    current = safe_start
+
+    while len(timestamps) < safe_max_frames:
+        if effective_end is not None and current > effective_end:
+            break
+        timestamps.append(round(current, 2))
+        current += safe_interval
+
+    return timestamps
+
+
 async def transcribe_with_deepgram(audio_path: Path):
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY não configurada.")
@@ -464,6 +530,75 @@ async def frame_extract(payload: FrameRequest, request: Request):
                 "status": "failed",
                 "error": str(e),
                 "timestamp": payload.timestamp,
+                "video_url": payload.video_url,
+                "video_id": payload.video_id,
+                "worker_job_id": payload.worker_job_id,
+                "version": APP_VERSION,
+            },
+        )
+
+
+@app.post("/frame/sample")
+async def frame_sample(payload: FrameBatchRequest, request: Request):
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            stream_url = await asyncio.to_thread(
+                get_video_stream_url,
+                payload.video_url,
+                tmp
+            )
+
+            duration_seconds = await asyncio.to_thread(
+                get_stream_duration_seconds,
+                stream_url
+            )
+
+            timestamps = build_frame_timestamps(
+                duration_seconds=duration_seconds,
+                start_time=payload.start_time,
+                end_time=payload.end_time,
+                interval_seconds=payload.interval_seconds,
+                max_frames=payload.max_frames,
+            )
+
+            frames = []
+            for timestamp in timestamps:
+                frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+                frame_path = FRAME_DIR / frame_name
+
+                await asyncio.to_thread(
+                    extract_frame_from_stream,
+                    stream_url,
+                    timestamp,
+                    frame_path
+                )
+
+                frame_url = str(request.base_url).rstrip("/") + f"/frame/file/{frame_name}"
+                frames.append({
+                    "timestamp": timestamp,
+                    "frame_file": frame_name,
+                    "frame_url": frame_url,
+                })
+
+        return {
+            "status": "ok",
+            "video_url": payload.video_url,
+            "video_id": payload.video_id,
+            "worker_job_id": payload.worker_job_id,
+            "duration_seconds": duration_seconds,
+            "sampled_frames": len(frames),
+            "frames": frames,
+            "version": APP_VERSION,
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": str(e),
                 "video_url": payload.video_url,
                 "video_id": payload.video_id,
                 "worker_job_id": payload.worker_job_id,
