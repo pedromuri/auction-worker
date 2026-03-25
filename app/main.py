@@ -2,6 +2,7 @@ from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
+from PIL import Image
 import tempfile
 import os
 import httpx
@@ -15,7 +16,7 @@ import time
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v12"
+APP_VERSION = "async-v13"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -65,6 +66,23 @@ class FrameBatchRequest(BaseModel):
     end_time: float | None = None
     interval_seconds: float = 15
     max_frames: int = 80
+
+
+class FrameBoundaryRequest(BaseModel):
+    video_url: str
+    video_id: str | None = None
+    worker_job_id: str | None = None
+    start_time: float = 0
+    end_time: float | None = None
+    interval_seconds: float = 8
+    max_frames: int = 300
+    full_diff_threshold: int = 10
+    focus_diff_threshold: int = 12
+    min_gap_seconds: float = 20
+    focus_left: float = 0.45
+    focus_top: float = 0.10
+    focus_right: float = 0.98
+    focus_bottom: float = 0.90
 
 
 def job_path(job_id: str) -> Path:
@@ -415,6 +433,65 @@ def build_frame_timestamps(
     return timestamps
 
 
+def average_hash(image: Image.Image, hash_size: int = 8) -> tuple[int, ...]:
+    resized = image.convert("L").resize((hash_size, hash_size))
+    pixels = list(resized.getdata())
+    mean = sum(pixels) / max(1, len(pixels))
+    return tuple(1 if pixel >= mean else 0 for pixel in pixels)
+
+
+def hamming_distance(a: tuple[int, ...], b: tuple[int, ...]) -> int:
+    return sum(1 for left, right in zip(a, b) if left != right)
+
+
+def clamp_region(
+    width: int,
+    height: int,
+    left_ratio: float,
+    top_ratio: float,
+    right_ratio: float,
+    bottom_ratio: float,
+) -> tuple[int, int, int, int]:
+    left = max(0, min(width - 1, int(width * left_ratio)))
+    top = max(0, min(height - 1, int(height * top_ratio)))
+    right = max(left + 1, min(width, int(width * right_ratio)))
+    bottom = max(top + 1, min(height, int(height * bottom_ratio)))
+    return left, top, right, bottom
+
+
+def compute_frame_hashes(
+    frame_path: Path,
+    *,
+    focus_left: float,
+    focus_top: float,
+    focus_right: float,
+    focus_bottom: float,
+) -> dict:
+    with Image.open(frame_path) as image:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        region = clamp_region(
+            width,
+            height,
+            focus_left,
+            focus_top,
+            focus_right,
+            focus_bottom,
+        )
+        focus = rgb.crop(region)
+        return {
+            "size": {"width": width, "height": height},
+            "focus_region_pixels": {
+                "left": region[0],
+                "top": region[1],
+                "right": region[2],
+                "bottom": region[3],
+            },
+            "full_hash": average_hash(rgb),
+            "focus_hash": average_hash(focus),
+        }
+
+
 async def transcribe_with_deepgram(audio_path: Path):
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY não configurada.")
@@ -667,6 +744,128 @@ async def frame_sample(payload: FrameBatchRequest, request: Request):
             "duration_seconds": duration_seconds,
             "sampled_frames": len(frames),
             "frames": frames,
+            "cached_video": video_path.name,
+            "version": APP_VERSION,
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": str(e),
+                "video_url": payload.video_url,
+                "video_id": payload.video_id,
+                "worker_job_id": payload.worker_job_id,
+                "version": APP_VERSION,
+            },
+        )
+
+
+@app.post("/frame/boundaries")
+async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
+    try:
+        video_path = await asyncio.to_thread(
+            download_visual_video,
+            payload.video_url,
+            payload.video_id
+        )
+
+        duration_seconds = await asyncio.to_thread(
+            get_stream_duration_seconds,
+            str(video_path)
+        )
+
+        timestamps = build_frame_timestamps(
+            duration_seconds=duration_seconds,
+            start_time=payload.start_time,
+            end_time=payload.end_time,
+            interval_seconds=payload.interval_seconds,
+            max_frames=payload.max_frames,
+        )
+
+        scanned_frames = []
+        boundary_candidates = []
+        previous = None
+
+        for timestamp in timestamps:
+            frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+            frame_path = FRAME_DIR / frame_name
+
+            await asyncio.to_thread(
+                extract_frame_from_stream,
+                str(video_path),
+                timestamp,
+                frame_path
+            )
+
+            hashes = await asyncio.to_thread(
+                compute_frame_hashes,
+                frame_path,
+                focus_left=payload.focus_left,
+                focus_top=payload.focus_top,
+                focus_right=payload.focus_right,
+                focus_bottom=payload.focus_bottom,
+            )
+
+            frame_url = str(request.base_url).rstrip("/") + f"/frame/file/{frame_name}"
+
+            full_diff = None
+            focus_diff = None
+            is_candidate = False
+            reason = "initial_frame"
+            score = 0
+
+            if previous is not None:
+                full_diff = hamming_distance(previous["full_hash"], hashes["full_hash"])
+                focus_diff = hamming_distance(previous["focus_hash"], hashes["focus_hash"])
+                score = max(full_diff, focus_diff)
+                is_candidate = (
+                    full_diff >= payload.full_diff_threshold
+                    or focus_diff >= payload.focus_diff_threshold
+                )
+                reason = "visual_change" if is_candidate else "stable"
+            else:
+                is_candidate = True
+                score = 64
+
+            frame_info = {
+                "timestamp": round(timestamp, 2),
+                "frame_file": frame_name,
+                "frame_url": frame_url,
+                "full_diff": full_diff,
+                "focus_diff": focus_diff,
+                "change_score": score,
+                "is_boundary_candidate": is_candidate,
+                "reason": reason,
+                "focus_region_pixels": hashes["focus_region_pixels"],
+                "image_size": hashes["size"],
+            }
+
+            scanned_frames.append(frame_info)
+
+            if is_candidate:
+                if (
+                    boundary_candidates
+                    and (timestamp - boundary_candidates[-1]["timestamp"]) < payload.min_gap_seconds
+                ):
+                    if score > (boundary_candidates[-1].get("change_score") or 0):
+                        boundary_candidates[-1] = frame_info
+                else:
+                    boundary_candidates.append(frame_info)
+
+            previous = hashes
+
+        return {
+            "status": "ok",
+            "video_url": payload.video_url,
+            "video_id": payload.video_id,
+            "worker_job_id": payload.worker_job_id,
+            "duration_seconds": duration_seconds,
+            "sampled_frames": len(scanned_frames),
+            "boundary_candidates": len(boundary_candidates),
+            "candidates": boundary_candidates,
+            "frames": scanned_frames,
             "cached_video": video_path.name,
             "version": APP_VERSION,
         }
