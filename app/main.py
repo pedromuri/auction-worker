@@ -10,10 +10,12 @@ import yt_dlp
 import uuid
 import json
 import asyncio
+import hashlib
+import time
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v11"
+APP_VERSION = "async-v12"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -33,6 +35,9 @@ JOB_DIR.mkdir(exist_ok=True)
 
 FRAME_DIR = Path("/tmp/frames")
 FRAME_DIR.mkdir(exist_ok=True)
+
+VIDEO_CACHE_DIR = Path("/tmp/video-cache")
+VIDEO_CACHE_DIR.mkdir(exist_ok=True)
 
 ROOT_DIR = Path("/app")
 FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
@@ -139,6 +144,82 @@ def find_downloaded_file(output_dir: Path, prefix: str) -> Path | None:
 
     candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
     return candidates[0]
+
+
+def get_visual_cache_key(video_url: str, video_id: str | None) -> str:
+    if video_id and video_id.strip():
+        return video_id.strip()
+    return hashlib.sha1(video_url.encode("utf-8")).hexdigest()[:16]
+
+
+def wait_for_cached_file(file_prefix: str, lock_path: Path, timeout_seconds: int = 600) -> Path | None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        cached = find_downloaded_file(VIDEO_CACHE_DIR, file_prefix)
+        if cached and cached.exists():
+            return cached
+        if not lock_path.exists():
+            break
+        time.sleep(1)
+    return find_downloaded_file(VIDEO_CACHE_DIR, file_prefix)
+
+
+def download_visual_video(video_url: str, video_id: str | None) -> Path:
+    cache_key = get_visual_cache_key(video_url, video_id)
+    file_prefix = f"visual_{cache_key}."
+    lock_path = VIDEO_CACHE_DIR / f"visual_{cache_key}.lock"
+
+    cached = find_downloaded_file(VIDEO_CACHE_DIR, file_prefix)
+    if cached and cached.exists():
+        return cached
+
+    lock_fd = None
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        output_template = str(VIDEO_CACHE_DIR / f"{file_prefix}%(ext)s")
+        cookie_file = write_cookies_file(VIDEO_CACHE_DIR)
+
+        format_attempts = [
+            "bestvideo[height<=360][ext=mp4]/best[height<=360][ext=mp4]/bestvideo[height<=360]/best[height<=360]",
+            "worstvideo[ext=mp4]/worst[ext=mp4]/worstvideo/worst",
+            "bestvideo/best",
+        ]
+
+        errors = []
+
+        for format_selector in format_attempts:
+            try:
+                ydl_opts = build_ydl_opts(output_template, cookie_file, format_selector)
+                ydl_opts["overwrites"] = False
+                ydl_opts["quiet"] = True
+                ydl_opts["noprogress"] = True
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([video_url])
+
+                downloaded = find_downloaded_file(VIDEO_CACHE_DIR, file_prefix)
+                if downloaded and downloaded.exists():
+                    return downloaded
+
+                errors.append(f"{format_selector}: download sem arquivo gerado")
+            except Exception as e:
+                errors.append(f"{format_selector}: {str(e)}")
+
+        raise RuntimeError(
+            "Erro ao baixar vídeo para amostragem visual. Tentativas: " + " | ".join(errors)
+        )
+    except FileExistsError:
+        waited = wait_for_cached_file(file_prefix, lock_path)
+        if waited and waited.exists():
+            return waited
+        raise RuntimeError("Timeout aguardando vídeo em cache para amostragem visual.")
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+            try:
+                lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def download_audio(video_url: str, output_dir: Path) -> Path:
@@ -257,6 +338,8 @@ def extract_frame_from_stream(stream_url: str, timestamp: float, frame_path: Pat
             str(timestamp),
             "-i",
             stream_url,
+            "-threads",
+            "1",
             "-frames:v",
             "1",
             "-q:v",
@@ -491,24 +574,21 @@ async def transcript_result(job_id: str):
 @app.post("/frame/extract")
 async def frame_extract(payload: FrameRequest, request: Request):
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
+        video_path = await asyncio.to_thread(
+            download_visual_video,
+            payload.video_url,
+            payload.video_id
+        )
 
-            stream_url = await asyncio.to_thread(
-                get_video_stream_url,
-                payload.video_url,
-                tmp
-            )
+        frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+        frame_path = FRAME_DIR / frame_name
 
-            frame_name = f"frame_{uuid.uuid4().hex}.jpg"
-            frame_path = FRAME_DIR / frame_name
-
-            await asyncio.to_thread(
-                extract_frame_from_stream,
-                stream_url,
-                payload.timestamp,
-                frame_path
-            )
+        await asyncio.to_thread(
+            extract_frame_from_stream,
+            str(video_path),
+            payload.timestamp,
+            frame_path
+        )
 
         frame_url = str(request.base_url).rstrip("/") + f"/frame/file/{frame_name}"
 
@@ -541,46 +621,43 @@ async def frame_extract(payload: FrameRequest, request: Request):
 @app.post("/frame/sample")
 async def frame_sample(payload: FrameBatchRequest, request: Request):
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
+        video_path = await asyncio.to_thread(
+            download_visual_video,
+            payload.video_url,
+            payload.video_id
+        )
 
-            stream_url = await asyncio.to_thread(
-                get_video_stream_url,
-                payload.video_url,
-                tmp
+        duration_seconds = await asyncio.to_thread(
+            get_stream_duration_seconds,
+            str(video_path)
+        )
+
+        timestamps = build_frame_timestamps(
+            duration_seconds=duration_seconds,
+            start_time=payload.start_time,
+            end_time=payload.end_time,
+            interval_seconds=payload.interval_seconds,
+            max_frames=payload.max_frames,
+        )
+
+        frames = []
+        for timestamp in timestamps:
+            frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+            frame_path = FRAME_DIR / frame_name
+
+            await asyncio.to_thread(
+                extract_frame_from_stream,
+                str(video_path),
+                timestamp,
+                frame_path
             )
 
-            duration_seconds = await asyncio.to_thread(
-                get_stream_duration_seconds,
-                stream_url
-            )
-
-            timestamps = build_frame_timestamps(
-                duration_seconds=duration_seconds,
-                start_time=payload.start_time,
-                end_time=payload.end_time,
-                interval_seconds=payload.interval_seconds,
-                max_frames=payload.max_frames,
-            )
-
-            frames = []
-            for timestamp in timestamps:
-                frame_name = f"frame_{uuid.uuid4().hex}.jpg"
-                frame_path = FRAME_DIR / frame_name
-
-                await asyncio.to_thread(
-                    extract_frame_from_stream,
-                    stream_url,
-                    timestamp,
-                    frame_path
-                )
-
-                frame_url = str(request.base_url).rstrip("/") + f"/frame/file/{frame_name}"
-                frames.append({
-                    "timestamp": timestamp,
-                    "frame_file": frame_name,
-                    "frame_url": frame_url,
-                })
+            frame_url = str(request.base_url).rstrip("/") + f"/frame/file/{frame_name}"
+            frames.append({
+                "timestamp": timestamp,
+                "frame_file": frame_name,
+                "frame_url": frame_url,
+            })
 
         return {
             "status": "ok",
@@ -590,6 +667,7 @@ async def frame_sample(payload: FrameBatchRequest, request: Request):
             "duration_seconds": duration_seconds,
             "sampled_frames": len(frames),
             "frames": frames,
+            "cached_video": video_path.name,
             "version": APP_VERSION,
         }
 
