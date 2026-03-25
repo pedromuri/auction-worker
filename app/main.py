@@ -16,7 +16,7 @@ import time
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v14"
+APP_VERSION = "async-v15"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -492,6 +492,133 @@ def compute_frame_hashes(
         }
 
 
+def compute_candidate_strength(
+    *,
+    full_diff: int,
+    focus_diff: int,
+    previous_score: int,
+    next_score: int,
+    full_threshold: int,
+    focus_threshold: int,
+) -> int:
+    focus_led = focus_diff >= focus_threshold
+    balanced_change = (
+        full_diff >= full_threshold
+        and focus_diff >= max(3, int(focus_threshold * 0.5))
+    )
+    local_peak = full_diff >= previous_score and full_diff >= next_score
+    stable_after = next_score <= max(full_threshold, focus_threshold)
+
+    strength = focus_diff * 2 + full_diff
+    if focus_led:
+        strength += 8
+    if balanced_change:
+        strength += 4
+    if local_peak:
+        strength += 6
+    if stable_after:
+        strength += 5
+    if full_diff >= full_threshold and focus_diff < max(2, int(focus_threshold * 0.4)):
+        strength -= 8
+    return strength
+
+
+def select_boundary_candidates(
+    scanned_frames: list[dict],
+    payload: FrameBoundaryRequest,
+) -> list[dict]:
+    if not scanned_frames:
+        return []
+
+    raw_candidates: list[dict] = []
+    full_threshold = max(1, int(payload.full_diff_threshold))
+    focus_threshold = max(1, int(payload.focus_diff_threshold))
+    min_strength = focus_threshold * 2 + full_threshold + 2
+
+    for index, frame in enumerate(scanned_frames):
+        full_diff = int(frame.get("full_diff") or 0)
+        focus_diff = int(frame.get("focus_diff") or 0)
+        score = int(frame.get("change_score") or 0)
+
+        if index == 0:
+            # Only keep the very first sampled frame when the sampling window
+            # starts at the beginning of the full video. For mid-window samples,
+            # the first frame is just context and usually creates false positives.
+            if float(payload.start_time or 0) <= 0.1:
+                candidate_info = {
+                    **frame,
+                    "analysis_timestamp": frame["timestamp"],
+                    "analysis_frame_file": frame["frame_file"],
+                    "analysis_frame_url": frame["frame_url"],
+                    "boundary_timestamp": frame["timestamp"],
+                    "boundary_frame_file": frame["frame_file"],
+                    "boundary_frame_url": frame["frame_url"],
+                    "candidate_strength": 96,
+                    "reason": "initial_context",
+                }
+                raw_candidates.append(candidate_info)
+            continue
+
+        prev_score = int(scanned_frames[index - 1].get("change_score") or 0)
+        next_score = (
+            int(scanned_frames[index + 1].get("change_score") or 0)
+            if index + 1 < len(scanned_frames)
+            else 0
+        )
+
+        focus_led = focus_diff >= focus_threshold
+        balanced_change = (
+            full_diff >= full_threshold
+            and focus_diff >= max(3, int(focus_threshold * 0.5))
+        )
+
+        if not (focus_led or balanced_change):
+            continue
+
+        candidate_strength = compute_candidate_strength(
+            full_diff=full_diff,
+            focus_diff=focus_diff,
+            previous_score=prev_score,
+            next_score=next_score,
+            full_threshold=full_threshold,
+            focus_threshold=focus_threshold,
+        )
+
+        if candidate_strength < min_strength:
+            continue
+
+        analysis_frame = scanned_frames[index - 1]
+        candidate_info = {
+            **frame,
+            "analysis_timestamp": analysis_frame["timestamp"],
+            "analysis_frame_file": analysis_frame["frame_file"],
+            "analysis_frame_url": analysis_frame["frame_url"],
+            "boundary_timestamp": frame["timestamp"],
+            "boundary_frame_file": frame["frame_file"],
+            "boundary_frame_url": frame["frame_url"],
+            "candidate_strength": candidate_strength,
+            "reason": "visual_change_focus" if focus_led else "visual_change_balanced",
+        }
+        raw_candidates.append(candidate_info)
+
+    if not raw_candidates:
+        return []
+
+    compressed: list[dict] = []
+    for candidate in raw_candidates:
+        timestamp = float(candidate.get("timestamp") or 0)
+        if (
+            compressed
+            and (timestamp - float(compressed[-1].get("timestamp") or 0)) < payload.min_gap_seconds
+        ):
+            if candidate.get("candidate_strength", 0) > compressed[-1].get("candidate_strength", 0):
+                compressed[-1] = candidate
+        else:
+            compressed.append(candidate)
+
+    return compressed
+
+
 async def transcribe_with_deepgram(audio_path: Path):
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY não configurada.")
@@ -785,7 +912,6 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
         )
 
         scanned_frames = []
-        boundary_candidates = []
         previous = None
 
         for timestamp in timestamps:
@@ -813,7 +939,7 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
             full_diff = None
             focus_diff = None
             is_candidate = False
-            reason = "initial_frame"
+            reason = "initial_context"
             score = 0
 
             if previous is not None:
@@ -825,9 +951,6 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
                     or focus_diff >= payload.focus_diff_threshold
                 )
                 reason = "visual_change" if is_candidate else "stable"
-            else:
-                is_candidate = True
-                score = 64
 
             frame_info = {
                 "timestamp": round(timestamp, 2),
@@ -844,30 +967,12 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
 
             scanned_frames.append(frame_info)
 
-            if is_candidate:
-                analysis_frame = previous["frame"] if previous and reason == "visual_change" else frame_info
-                candidate_info = {
-                    **frame_info,
-                    "analysis_timestamp": analysis_frame["timestamp"],
-                    "analysis_frame_file": analysis_frame["frame_file"],
-                    "analysis_frame_url": analysis_frame["frame_url"],
-                    "boundary_timestamp": frame_info["timestamp"],
-                    "boundary_frame_file": frame_info["frame_file"],
-                    "boundary_frame_url": frame_info["frame_url"],
-                }
-                if (
-                    boundary_candidates
-                    and (timestamp - boundary_candidates[-1]["timestamp"]) < payload.min_gap_seconds
-                ):
-                    if score > (boundary_candidates[-1].get("change_score") or 0):
-                        boundary_candidates[-1] = candidate_info
-                else:
-                    boundary_candidates.append(candidate_info)
-
             previous = {
                 "hashes": hashes,
                 "frame": frame_info,
             }
+
+        boundary_candidates = select_boundary_candidates(scanned_frames, payload)
 
         return {
             "status": "ok",
