@@ -16,7 +16,7 @@ import time
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v13"
+APP_VERSION = "async-v14"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -817,8 +817,8 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
             score = 0
 
             if previous is not None:
-                full_diff = hamming_distance(previous["full_hash"], hashes["full_hash"])
-                focus_diff = hamming_distance(previous["focus_hash"], hashes["focus_hash"])
+                full_diff = hamming_distance(previous["hashes"]["full_hash"], hashes["full_hash"])
+                focus_diff = hamming_distance(previous["hashes"]["focus_hash"], hashes["focus_hash"])
                 score = max(full_diff, focus_diff)
                 is_candidate = (
                     full_diff >= payload.full_diff_threshold
@@ -845,16 +845,29 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
             scanned_frames.append(frame_info)
 
             if is_candidate:
+                analysis_frame = previous["frame"] if previous and reason == "visual_change" else frame_info
+                candidate_info = {
+                    **frame_info,
+                    "analysis_timestamp": analysis_frame["timestamp"],
+                    "analysis_frame_file": analysis_frame["frame_file"],
+                    "analysis_frame_url": analysis_frame["frame_url"],
+                    "boundary_timestamp": frame_info["timestamp"],
+                    "boundary_frame_file": frame_info["frame_file"],
+                    "boundary_frame_url": frame_info["frame_url"],
+                }
                 if (
                     boundary_candidates
                     and (timestamp - boundary_candidates[-1]["timestamp"]) < payload.min_gap_seconds
                 ):
                     if score > (boundary_candidates[-1].get("change_score") or 0):
-                        boundary_candidates[-1] = frame_info
+                        boundary_candidates[-1] = candidate_info
                 else:
-                    boundary_candidates.append(frame_info)
+                    boundary_candidates.append(candidate_info)
 
-            previous = hashes
+            previous = {
+                "hashes": hashes,
+                "frame": frame_info,
+            }
 
         return {
             "status": "ok",
