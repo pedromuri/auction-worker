@@ -2,7 +2,7 @@ from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import tempfile
 import os
 import httpx
@@ -16,7 +16,7 @@ import time
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v14"
+APP_VERSION = "async-v16"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -43,6 +43,7 @@ VIDEO_CACHE_DIR.mkdir(exist_ok=True)
 ROOT_DIR = Path("/app")
 FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
 DENO_PATH = Path("/usr/local/bin/deno")
+PRE_BOUNDARY_OFFSETS = [5.0, 3.0, 1.5, 0.5]
 
 
 class TranscriptRequest(BaseModel):
@@ -433,6 +434,136 @@ def build_frame_timestamps(
     return timestamps
 
 
+def build_public_frame_url(base_url: str, frame_name: str) -> str:
+    return base_url.rstrip("/") + f"/frame/file/{frame_name}"
+
+
+def unique_sorted_timestamps(values: list[float]) -> list[float]:
+    seen = set()
+    ordered: list[float] = []
+    for value in sorted(values):
+        rounded = round(float(value), 2)
+        if rounded in seen:
+            continue
+        seen.add(rounded)
+        ordered.append(rounded)
+    return ordered
+
+
+def build_preboundary_timestamps(
+    *,
+    boundary_timestamp: float,
+    start_time: float,
+    offsets: list[float] | None = None,
+) -> list[float]:
+    offsets = offsets or PRE_BOUNDARY_OFFSETS
+    safe_boundary = max(0.0, float(boundary_timestamp or 0))
+    safe_start = max(0.0, float(start_time or 0))
+    timestamps = [
+        safe_boundary - float(offset)
+        for offset in offsets
+        if (safe_boundary - float(offset)) >= safe_start
+    ]
+
+    if not timestamps and safe_boundary > safe_start:
+        timestamps = [max(safe_start, safe_boundary - 0.5)]
+
+    return unique_sorted_timestamps(timestamps)
+
+
+def build_montage_image(
+    frames: list[dict],
+    montage_path: Path,
+):
+    if not frames:
+        raise RuntimeError("Nenhum frame de suporte disponível para montar o painel de análise.")
+
+    target_height = 220
+    padding = 8
+    caption_height = 22
+    font = ImageFont.load_default()
+    prepared: list[tuple[Image.Image, str, Path]] = []
+
+    try:
+        for frame in frames:
+            frame_path = Path(frame["frame_path"])
+            with Image.open(frame_path) as source:
+                rgb = source.convert("RGB")
+                ratio = target_height / max(1, rgb.height)
+                width = max(1, int(rgb.width * ratio))
+                resized = rgb.resize((width, target_height))
+                prepared.append((resized, frame["label"], frame_path))
+
+        total_width = sum(image.width for image, _, _ in prepared) + padding * (len(prepared) + 1)
+        total_height = target_height + caption_height + (padding * 2)
+        canvas = Image.new("RGB", (total_width, total_height), color=(245, 246, 248))
+        draw = ImageDraw.Draw(canvas)
+
+        x = padding
+        for image, label, _ in prepared:
+            canvas.paste(image, (x, padding + caption_height))
+            draw.rectangle(
+                [(x, padding), (x + image.width, padding + caption_height - 2)],
+                fill=(32, 35, 42),
+            )
+            draw.text((x + 6, padding + 4), label, fill=(255, 255, 255), font=font)
+            x += image.width + padding
+
+        canvas.save(montage_path, format="JPEG", quality=92)
+    finally:
+        for image, _, _ in prepared:
+            image.close()
+
+
+def build_support_bundle(
+    *,
+    video_path: str,
+    boundary_timestamp: float,
+    start_time: float,
+    request_base_url: str,
+) -> dict:
+    support_timestamps = build_preboundary_timestamps(
+        boundary_timestamp=boundary_timestamp,
+        start_time=start_time,
+    )
+
+    support_frames: list[dict] = []
+    for timestamp in support_timestamps:
+        frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+        frame_path = FRAME_DIR / frame_name
+        extract_frame_from_stream(video_path, timestamp, frame_path)
+        offset = round(float(boundary_timestamp) - float(timestamp), 2)
+        support_frames.append({
+            "timestamp": round(timestamp, 2),
+            "offset_seconds": offset,
+            "frame_file": frame_name,
+            "frame_path": str(frame_path),
+            "frame_url": build_public_frame_url(request_base_url, frame_name),
+            "label": f"T-{offset:.1f}s",
+        })
+
+    montage_name = f"frame_{uuid.uuid4().hex}.jpg"
+    montage_path = FRAME_DIR / montage_name
+    build_montage_image(support_frames, montage_path)
+
+    return {
+        "support_frames": [
+            {
+                "timestamp": frame["timestamp"],
+                "offset_seconds": frame["offset_seconds"],
+                "frame_file": frame["frame_file"],
+                "frame_url": frame["frame_url"],
+                "label": frame["label"],
+            }
+            for frame in support_frames
+        ],
+        "analysis_frame_file": montage_name,
+        "analysis_frame_url": build_public_frame_url(request_base_url, montage_name),
+        "analysis_timestamp": support_frames[-1]["timestamp"] if support_frames else round(boundary_timestamp, 2),
+        "analysis_offsets_seconds": [frame["offset_seconds"] for frame in support_frames],
+    }
+
+
 def average_hash(image: Image.Image, hash_size: int = 8) -> tuple[int, ...]:
     resized = image.convert("L").resize((hash_size, hash_size))
     pixels = list(resized.getdata())
@@ -784,6 +915,7 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
             max_frames=payload.max_frames,
         )
 
+        request_base_url = str(request.base_url)
         scanned_frames = []
         boundary_candidates = []
         previous = None
@@ -808,7 +940,7 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
                 focus_bottom=payload.focus_bottom,
             )
 
-            frame_url = str(request.base_url).rstrip("/") + f"/frame/file/{frame_name}"
+            frame_url = build_public_frame_url(request_base_url, frame_name)
 
             full_diff = None
             focus_diff = None
@@ -826,8 +958,8 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
                 )
                 reason = "visual_change" if is_candidate else "stable"
             else:
-                is_candidate = True
-                score = 64
+                is_candidate = False
+                score = 0
 
             frame_info = {
                 "timestamp": round(timestamp, 2),
@@ -848,12 +980,15 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
                 analysis_frame = previous["frame"] if previous and reason == "visual_change" else frame_info
                 candidate_info = {
                     **frame_info,
+                    "boundary_type": "panel_disappeared_or_transition",
                     "analysis_timestamp": analysis_frame["timestamp"],
                     "analysis_frame_file": analysis_frame["frame_file"],
                     "analysis_frame_url": analysis_frame["frame_url"],
                     "boundary_timestamp": frame_info["timestamp"],
                     "boundary_frame_file": frame_info["frame_file"],
                     "boundary_frame_url": frame_info["frame_url"],
+                    "analysis_single_frame_file": analysis_frame["frame_file"],
+                    "analysis_single_frame_url": analysis_frame["frame_url"],
                 }
                 if (
                     boundary_candidates
@@ -869,6 +1004,27 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
                 "frame": frame_info,
             }
 
+        enriched_candidates = []
+        for candidate in boundary_candidates:
+            enriched = dict(candidate)
+            try:
+                support_bundle = await asyncio.to_thread(
+                    build_support_bundle,
+                    video_path=str(video_path),
+                    boundary_timestamp=float(candidate["boundary_timestamp"]),
+                    start_time=float(payload.start_time or 0),
+                    request_base_url=request_base_url,
+                )
+                enriched.update(support_bundle)
+                enriched["analysis_mode"] = "pre_boundary_montage"
+                enriched["support_frame_count"] = len(support_bundle["support_frames"])
+            except Exception as e:
+                enriched["analysis_mode"] = "single_frame_fallback"
+                enriched["support_frames"] = []
+                enriched["support_frame_count"] = 0
+                enriched["support_generation_error"] = str(e)
+            enriched_candidates.append(enriched)
+
         return {
             "status": "ok",
             "video_url": payload.video_url,
@@ -876,8 +1032,8 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
             "worker_job_id": payload.worker_job_id,
             "duration_seconds": duration_seconds,
             "sampled_frames": len(scanned_frames),
-            "boundary_candidates": len(boundary_candidates),
-            "candidates": boundary_candidates,
+            "boundary_candidates": len(enriched_candidates),
+            "candidates": enriched_candidates,
             "frames": scanned_frames,
             "cached_video": video_path.name,
             "version": APP_VERSION,
