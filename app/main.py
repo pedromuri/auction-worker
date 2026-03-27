@@ -79,12 +79,14 @@ PANEL_LAYOUT_TEMPLATES = {
         "info": (0.15, 0.78, 0.68, 0.95),
         "price": (0.67, 0.75, 0.995, 0.95),
         "price_focus": (0.76, 0.75, 0.995, 0.95),
+        "price_top": (0.73, 0.74, 0.995, 0.885),
     },
     "generic_bottom_bar_v1": {
         "lot": (0.00, 0.72, 0.19, 0.995),
         "info": (0.18, 0.76, 0.70, 0.95),
         "price": (0.68, 0.73, 0.995, 0.95),
         "price_focus": (0.77, 0.73, 0.995, 0.95),
+        "price_top": (0.73, 0.72, 0.995, 0.88),
     },
 }
 
@@ -758,8 +760,9 @@ def parse_digits(value: str) -> str:
 
 
 def parse_money_number(text: str) -> float | None:
-    normalized = text.replace("R$", " ").replace("RS", " ").replace("S$", " ")
+    normalized = text.upper().replace("R$", " ").replace("RS", " ").replace("S$", " ")
     normalized = normalized.replace(" ", "")
+    normalized = normalized.replace("O", "0")
     matches = re.findall(r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d{3,6})", normalized)
     for match in matches:
         candidate = match
@@ -771,6 +774,15 @@ def parse_money_number(text: str) -> float | None:
             candidate = candidate.replace(".", "")
         try:
             amount = float(candidate)
+            if 100 <= amount <= 20000:
+                return round(amount, 2)
+        except Exception:
+            continue
+
+    compact_matches = re.findall(r"(\d{4,6})(\d{2})", normalized)
+    for integer_part, decimal_part in compact_matches:
+        try:
+            amount = float(f"{integer_part}.{decimal_part}")
             if 100 <= amount <= 20000:
                 return round(amount, 2)
         except Exception:
@@ -896,6 +908,7 @@ def extract_panel_fields(
     info_crop = crop_by_ratio(image, *template["info"])
     price_crop = crop_by_ratio(image, *template["price"])
     price_focus_crop = crop_by_ratio(image, *template["price_focus"])
+    price_top_crop = crop_by_ratio(image, *template["price_top"])
 
     lot_texts = ocr_text_variants(
         lot_crop,
@@ -929,9 +942,17 @@ def extract_panel_fields(
         ],
         thresholds=[None, 150, 185],
     )
+    price_top_texts = ocr_text_variants(
+        price_top_crop,
+        configs=[
+            "--psm 7 -c tessedit_char_whitelist=0123456789R$.,",
+            "--psm 8 -c tessedit_char_whitelist=0123456789R$.,",
+        ],
+        thresholds=[None, 135, 155, 175, 195],
+    )
 
     info_values = parse_info_value(info_texts)
-    price_values = [parse_money_number(text) for text in (price_focus_texts + price_texts)]
+    price_values = [parse_money_number(text) for text in (price_top_texts + price_focus_texts + price_texts)]
     price_values = [value for value in price_values if value is not None]
     price = max(price_values) if price_values else None
     weight_value = int(info_values["peso_medio_kg"]) if info_values["peso_medio_kg"].isdigit() else None
@@ -952,6 +973,7 @@ def extract_panel_fields(
             "layout_id": layout_id,
             "lot_texts": lot_texts[:3],
             "info_texts": info_texts[:3],
+            "price_top_texts": price_top_texts[:3],
             "price_texts": price_texts[:3],
             "price_focus_texts": price_focus_texts[:3],
         },
