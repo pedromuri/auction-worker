@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v19"
+APP_VERSION = "async-v18"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -50,7 +50,6 @@ ROOT_DIR = Path("/app")
 FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
 DENO_PATH = Path("/usr/local/bin/deno")
 PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
-PRICE_TRACK_OFFSETS = [6.0, 5.0, 4.0, 3.0, 2.0, 1.2, 0.8, 0.4]
 PANEL_CATEGORIES = [
     "Bezerro",
     "Garrote",
@@ -168,9 +167,6 @@ class PricePassItem(BaseModel):
     support_frames: list[PanelOcrSupportFrame] = []
     weight_hint: str | None = None
     layout_hint: str | None = None
-    video_url: str | None = None
-    video_id: str | None = None
-    boundary_timestamp: float | None = None
     metadata: dict | None = None
 
 
@@ -858,39 +854,6 @@ def choose_price_value(texts: list[str], weight_value: int | None = None) -> flo
     return ranked[0][0]
 
 
-def choose_price_track(price_frames: list[dict], weight_value: int | None = None) -> float | None:
-    valid_frames: list[dict] = []
-    for frame in price_frames:
-        value = frame.get("price_value")
-        if value is None:
-            continue
-        if weight_value:
-            price_per_kg = value / weight_value
-            if not (5 <= price_per_kg <= 35):
-                continue
-        valid_frames.append(frame)
-
-    if not valid_frames:
-        return None
-
-    valid_frames.sort(key=lambda item: float(item.get("timestamp") or 0))
-    tail = valid_frames[-5:] if len(valid_frames) > 5 else valid_frames
-
-    ranked: list[tuple[float, float, float, float]] = []
-    for index, frame in enumerate(tail):
-        candidate = float(frame["price_value"])
-        support = sum(1 for item in valid_frames if abs(float(item["price_value"]) - candidate) <= 120)
-        tail_support = sum(1 for item in tail if abs(float(item["price_value"]) - candidate) <= 120)
-        later_frames = tail[index + 1 :]
-        future_penalty = sum(1 for item in later_frames if float(item["price_value"]) < (candidate - 120))
-        recency = float(frame.get("timestamp") or 0)
-        score = (tail_support * 100) + (support * 25) + recency - (future_penalty * 120)
-        ranked.append((score, recency, candidate, candidate))
-
-    ranked.sort(reverse=True)
-    return ranked[0][2] if ranked else None
-
-
 def extract_price_only(
     image: Image.Image,
     *,
@@ -1167,60 +1130,22 @@ async def run_price_pass(
     support_frames: list[PanelOcrSupportFrame],
     weight_hint: str | None,
     layout_hint: str | None,
-    video_url: str | None = None,
-    video_id: str | None = None,
-    boundary_timestamp: float | None = None,
 ) -> dict:
-    sources: list[dict] = []
-    generated_frame_files: list[Path] = []
-
-    if video_url and boundary_timestamp is not None:
-        video_path = await asyncio.to_thread(download_visual_video, video_url, video_id)
-        timestamps = build_preboundary_timestamps(
-            boundary_timestamp=float(boundary_timestamp),
-            start_time=max(0.0, float(boundary_timestamp) - 8.0),
-            offsets=PRICE_TRACK_OFFSETS,
-        )
-        for timestamp in timestamps:
-            frame_name = f"frame_{uuid.uuid4().hex}.jpg"
-            frame_path = FRAME_DIR / frame_name
-            await asyncio.to_thread(
-                extract_frame_from_stream,
-                str(video_path),
-                float(timestamp),
-                frame_path,
-            )
-            generated_frame_files.append(frame_path)
-            offset = max(0.0, float(boundary_timestamp) - float(timestamp))
-            sources.append({
-                "frame_file": frame_name,
-                "frame_url": "",
-                "label": f"price_track_tminus_{offset:.1f}s",
-                "timestamp": float(timestamp),
-                "offset_seconds": round(offset, 2),
-            })
-
-    if not sources:
-        sources = [{
-            "frame_file": frame_file,
-            "frame_url": frame_url,
-            "label": "primary_frame",
-            "timestamp": None,
-            "offset_seconds": None,
-        }]
-        for frame in support_frames:
-            sources.append({
-                "frame_file": frame.frame_file,
-                "frame_url": frame.frame_url,
-                "label": frame.label or "support_frame",
-                "timestamp": frame.timestamp,
-                "offset_seconds": frame.offset_seconds,
-            })
+    sources = [{
+        "frame_file": frame_file,
+        "frame_url": frame_url,
+        "label": "primary_frame",
+    }]
+    for frame in support_frames:
+        sources.append({
+            "frame_file": frame.frame_file,
+            "frame_url": frame.frame_url,
+            "label": frame.label or "support_frame",
+        })
 
     price_texts: list[str] = []
     layout_candidates: list[str] = []
     debug_frames: list[dict] = []
-    price_frames: list[dict] = []
 
     for source in sources:
         if not source["frame_file"] and not source["frame_url"]:
@@ -1243,50 +1168,30 @@ async def run_price_pass(
         layout_id = extracted.get("layout_id", "")
         if layout_id:
             layout_candidates.append(layout_id)
-        price_value = parse_money_number(extracted.get("preco_compra_rs", ""))
-        price_frames.append({
-            "label": source["label"],
-            "timestamp": float(source.get("timestamp") or 0),
-            "offset_seconds": source.get("offset_seconds"),
-            "price_value": price_value,
-        })
         debug_frames.append({
             "label": source["label"],
-            "timestamp": source.get("timestamp"),
-            "offset_seconds": source.get("offset_seconds"),
-            "price_value": price_value,
             **extracted.get("_price_debug", {}),
         })
         price_texts.extend(extracted.get("_price_debug", {}).get("price_focus_texts", []))
         price_texts.extend(extracted.get("_price_debug", {}).get("price_texts", []))
 
     weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
-    best_price = choose_price_track(price_frames, weight_value=weight_value)
-    if best_price is None:
-        best_price = choose_price_value(price_texts, weight_value=weight_value)
+    best_price = choose_price_value(price_texts, weight_value=weight_value)
     price_per_kg = round(best_price / weight_value, 2) if best_price and weight_value else None
     layout_id = choose_consensus(layout_candidates)
 
-    try:
-        return {
-            "status": "ok",
-            "preco_compra_rs": format_brl(best_price),
-            "preco_kg_rs": format_decimal_brl(price_per_kg),
+    return {
+        "status": "ok",
+        "preco_compra_rs": format_brl(best_price),
+        "preco_kg_rs": format_decimal_brl(price_per_kg),
+        "layout_id": layout_id,
+        "_price_pass_debug": {
             "layout_id": layout_id,
-            "_price_pass_debug": {
-                "layout_id": layout_id,
-                "price_frames": debug_frames,
-                "candidate_text_count": len(price_texts),
-                "sampled_frames": len(price_frames),
-            },
-            "version": APP_VERSION,
-        }
-    finally:
-        for frame_path in generated_frame_files:
-            try:
-                frame_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            "price_frames": debug_frames,
+            "candidate_text_count": len(price_texts),
+        },
+        "version": APP_VERSION,
+    }
 
 
 async def run_panel_ocr(
@@ -1913,9 +1818,6 @@ async def frame_price_pass_batch(payload: PricePassBatchRequest):
                     support_frames=item.support_frames,
                     weight_hint=item.weight_hint,
                     layout_hint=item.layout_hint,
-                    video_url=item.video_url,
-                    video_id=item.video_id,
-                    boundary_timestamp=item.boundary_timestamp,
                 )
                 if item.metadata:
                     enriched["metadata"] = item.metadata
