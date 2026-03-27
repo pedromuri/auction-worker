@@ -146,6 +146,20 @@ class PanelOcrRequest(BaseModel):
     layout_hint: str | None = None
 
 
+class PanelOcrBatchItem(BaseModel):
+    frame_file: str | None = None
+    frame_url: str | None = None
+    timestamp: float | None = None
+    support_frames: list[PanelOcrSupportFrame] = []
+    categories: list[str] | None = None
+    layout_hint: str | None = None
+    metadata: dict | None = None
+
+
+class PanelOcrBatchRequest(BaseModel):
+    items: list[PanelOcrBatchItem]
+
+
 def job_path(job_id: str) -> Path:
     return JOB_DIR / f"{job_id}.json"
 
@@ -1004,6 +1018,62 @@ def build_ocr_consensus(frame_results: list[dict]) -> dict:
     }
 
 
+async def run_panel_ocr(
+    *,
+    frame_file: str | None,
+    frame_url: str | None,
+    timestamp: float | None,
+    support_frames: list[PanelOcrSupportFrame],
+    categories: list[str] | None,
+    layout_hint: str | None,
+) -> dict:
+    resolved_categories = categories or PANEL_CATEGORIES
+    sources = [{
+        "frame_file": frame_file,
+        "frame_url": frame_url,
+        "timestamp": timestamp,
+        "label": "primary_frame",
+    }]
+    for frame in support_frames:
+        sources.append({
+            "frame_file": frame.frame_file,
+            "frame_url": frame.frame_url,
+            "timestamp": frame.timestamp,
+            "label": frame.label or "support_frame",
+        })
+
+    frame_results: list[dict] = []
+    for source in sources:
+        if not source["frame_file"] and not source["frame_url"]:
+            continue
+        image = await asyncio.to_thread(
+            open_frame_image,
+            source["frame_file"],
+            source["frame_url"],
+        )
+        try:
+            extracted = await asyncio.to_thread(
+                extract_panel_fields,
+                image,
+                resolved_categories,
+                layout_hint,
+            )
+        finally:
+            image.close()
+
+        frame_results.append({
+            "frame_file": source["frame_file"] or "",
+            "frame_url": source["frame_url"] or "",
+            "timestamp": source["timestamp"],
+            "label": source["label"],
+            **extracted,
+        })
+
+    consensus = build_ocr_consensus(frame_results)
+    consensus["version"] = APP_VERSION
+    return consensus
+
+
 def average_hash(image: Image.Image, hash_size: int = 8) -> tuple[int, ...]:
     resized = image.convert("L").resize((hash_size, hash_size))
     pixels = list(resized.getdata())
@@ -1496,51 +1566,58 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
 @app.post("/frame/panel-ocr")
 async def frame_panel_ocr(payload: PanelOcrRequest):
     try:
-        categories = payload.categories or PANEL_CATEGORIES
-        sources = [{
-            "frame_file": payload.frame_file,
-            "frame_url": payload.frame_url,
-            "timestamp": payload.timestamp,
-            "label": "primary_frame",
-        }]
-        for frame in payload.support_frames:
-            sources.append({
-                "frame_file": frame.frame_file,
-                "frame_url": frame.frame_url,
-                "timestamp": frame.timestamp,
-                "label": frame.label or "support_frame",
-            })
+        return await run_panel_ocr(
+            frame_file=payload.frame_file,
+            frame_url=payload.frame_url,
+            timestamp=payload.timestamp,
+            support_frames=payload.support_frames,
+            categories=payload.categories,
+            layout_hint=payload.layout_hint,
+        )
 
-        frame_results: list[dict] = []
-        for source in sources:
-            if not source["frame_file"] and not source["frame_url"]:
-                continue
-            image = await asyncio.to_thread(
-                open_frame_image,
-                source["frame_file"],
-                source["frame_url"],
-            )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": str(e),
+                "version": APP_VERSION,
+            },
+        )
+
+
+@app.post("/frame/panel-ocr-batch")
+async def frame_panel_ocr_batch(payload: PanelOcrBatchRequest):
+    try:
+        results: list[dict] = []
+        for item in payload.items:
             try:
-                extracted = await asyncio.to_thread(
-                    extract_panel_fields,
-                    image,
-                    categories,
-                    payload.layout_hint,
+                consensus = await run_panel_ocr(
+                    frame_file=item.frame_file,
+                    frame_url=item.frame_url,
+                    timestamp=item.timestamp,
+                    support_frames=item.support_frames,
+                    categories=item.categories,
+                    layout_hint=item.layout_hint,
                 )
-            finally:
-                image.close()
+                if item.metadata:
+                    consensus["metadata"] = item.metadata
+                results.append(consensus)
+            except Exception as item_error:
+                results.append({
+                    "status": "failed",
+                    "error": str(item_error),
+                    "metadata": item.metadata or {},
+                    "version": APP_VERSION,
+                    "frame_results": [],
+                })
 
-            frame_results.append({
-                "frame_file": source["frame_file"] or "",
-                "frame_url": source["frame_url"] or "",
-                "timestamp": source["timestamp"],
-                "label": source["label"],
-                **extracted,
-            })
-
-        consensus = build_ocr_consensus(frame_results)
-        consensus["version"] = APP_VERSION
-        return consensus
+        return {
+            "status": "ok",
+            "results": results,
+            "count": len(results),
+            "version": APP_VERSION,
+        }
 
     except Exception as e:
         return JSONResponse(
