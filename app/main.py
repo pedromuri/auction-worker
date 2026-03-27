@@ -16,12 +16,13 @@ import time
 import re
 from io import BytesIO
 from difflib import SequenceMatcher
+from collections import Counter
 
 import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v17"
+APP_VERSION = "async-v18"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -753,13 +754,61 @@ def ocr_text_variants(image: Image.Image, configs: list[str], thresholds: list[i
     return unique
 
 
+def enhance_price_variants(image: Image.Image) -> list[Image.Image]:
+    grayscale = ImageOps.grayscale(image)
+    grayscale = ImageOps.autocontrast(grayscale)
+    grayscale = grayscale.resize((grayscale.width * 5, grayscale.height * 5))
+    grayscale = grayscale.filter(ImageFilter.MedianFilter(size=3))
+    grayscale = ImageEnhance.Contrast(grayscale).enhance(3.0)
+    grayscale = ImageEnhance.Sharpness(grayscale).enhance(2.2)
+
+    variants = [grayscale]
+    for threshold in (135, 155, 175, 195, 215):
+        binary = grayscale.point(lambda p, t=threshold: 255 if p >= t else 0)
+        variants.append(binary)
+        variants.append(ImageOps.invert(binary))
+    return variants
+
+
+def ocr_price_texts(image: Image.Image) -> list[str]:
+    values: list[str] = []
+    configs = [
+        "--psm 7 -c tessedit_char_whitelist=0123456789.,",
+        "--psm 8 -c tessedit_char_whitelist=0123456789.,",
+        "--psm 13 -c tessedit_char_whitelist=0123456789.,",
+    ]
+    for prepared in enhance_price_variants(image):
+        for config in configs:
+            try:
+                text = pytesseract.image_to_string(prepared, lang="por", config=config)
+            except pytesseract.TesseractNotFoundError as exc:
+                raise RuntimeError("Tesseract OCR nÃ£o estÃ¡ disponÃ­vel no container.") from exc
+            cleaned = " ".join((text or "").replace("\n", " ").split())
+            if cleaned:
+                values.append(cleaned)
+    unique: list[str] = []
+    seen = set()
+    for value in values:
+        key = value.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(value.strip())
+    return unique
+
+
 def parse_digits(value: str) -> str:
     return "".join(ch for ch in value if ch.isdigit())
 
 
 def parse_money_number(text: str) -> float | None:
-    normalized = text.replace("R$", " ").replace("RS", " ").replace("S$", " ")
-    normalized = normalized.replace(" ", "")
+    normalized = (
+        text.replace("R$", " ")
+        .replace("RS", " ")
+        .replace("S$", " ")
+        .replace("r$", " ")
+        .replace(" ", "")
+    )
+    normalized = normalized.replace("O", "0").replace("o", "0")
     matches = re.findall(r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d{3,6})", normalized)
     for match in matches:
         candidate = match
@@ -771,11 +820,31 @@ def parse_money_number(text: str) -> float | None:
             candidate = candidate.replace(".", "")
         try:
             amount = float(candidate)
-            if 100 <= amount <= 20000:
+            if 500 <= amount <= 20000:
                 return round(amount, 2)
         except Exception:
             continue
     return None
+
+
+def choose_price_value(texts: list[str], weight_value: int | None = None) -> float | None:
+    candidates: list[float] = []
+    for text in texts:
+        value = parse_money_number(text)
+        if value is None:
+            continue
+        if weight_value:
+            price_per_kg = value / weight_value
+            if not (5 <= price_per_kg <= 80):
+                continue
+        candidates.append(round(value, 2))
+
+    if not candidates:
+        return None
+
+    counts = Counter(candidates)
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], -item[0]))
+    return ranked[0][0]
 
 
 def parse_lot_value(texts: list[str]) -> str:
@@ -913,28 +982,11 @@ def extract_panel_fields(
         ],
         thresholds=[None, 180, 210],
     )
-    price_texts = ocr_text_variants(
-        price_crop,
-        configs=[
-            "--psm 7",
-            "--psm 6",
-        ],
-        thresholds=[None, 150, 185],
-    )
-    price_focus_texts = ocr_text_variants(
-        price_focus_crop,
-        configs=[
-            "--psm 7",
-            "--psm 8",
-        ],
-        thresholds=[None, 150, 185],
-    )
-
     info_values = parse_info_value(info_texts)
-    price_values = [parse_money_number(text) for text in (price_focus_texts + price_texts)]
-    price_values = [value for value in price_values if value is not None]
-    price = max(price_values) if price_values else None
     weight_value = int(info_values["peso_medio_kg"]) if info_values["peso_medio_kg"].isdigit() else None
+    price_texts = ocr_price_texts(price_crop)
+    price_focus_texts = ocr_price_texts(price_focus_crop)
+    price = choose_price_value(price_focus_texts + price_texts, weight_value=weight_value)
     price_per_kg = round(price / weight_value, 2) if price and weight_value else None
 
     return {
