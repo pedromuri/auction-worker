@@ -4,3 +4,4 @@ httpx
 pydantic
 yt-dlp[default]
 Pillow
+pytesseract

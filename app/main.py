@@ -2,7 +2,7 @@ from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageEnhance
 import tempfile
 import os
 import httpx
@@ -13,10 +13,15 @@ import json
 import asyncio
 import hashlib
 import time
+import re
+from io import BytesIO
+from difflib import SequenceMatcher
+
+import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v16"
+APP_VERSION = "async-v17"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -43,7 +48,45 @@ VIDEO_CACHE_DIR.mkdir(exist_ok=True)
 ROOT_DIR = Path("/app")
 FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
 DENO_PATH = Path("/usr/local/bin/deno")
-PRE_BOUNDARY_OFFSETS = [5.0, 3.0, 1.5, 0.5]
+PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
+PANEL_CATEGORIES = [
+    "Bezerro",
+    "Garrote",
+    "Vaca",
+    "Boi magro",
+    "Toruno",
+    "Novilha",
+    "Bezerra fêmea",
+    "Vaca prenha",
+    "Vaca parida",
+    "Cruz industrial",
+    "Macho(s) Nelore",
+    "Macho(s) Crz. Ind.",
+    "Macho(s) Nelore e Crz Ind",
+    "Macho(s) Anel",
+    "Macho(s) Tricross",
+    "Macho(s) Touruno",
+    "Macho(s) Crz Ind",
+    "Nelore",
+    "Macho(s) Cruzado",
+    "Anel",
+    "Cruzado",
+    "Touruno",
+]
+PANEL_LAYOUT_TEMPLATES = {
+    "correa_green_bar_v1": {
+        "lot": (0.00, 0.74, 0.17, 0.995),
+        "info": (0.15, 0.78, 0.68, 0.95),
+        "price": (0.67, 0.75, 0.995, 0.95),
+        "price_focus": (0.76, 0.75, 0.995, 0.95),
+    },
+    "generic_bottom_bar_v1": {
+        "lot": (0.00, 0.72, 0.19, 0.995),
+        "info": (0.18, 0.76, 0.70, 0.95),
+        "price": (0.68, 0.73, 0.995, 0.95),
+        "price_focus": (0.77, 0.73, 0.995, 0.95),
+    },
+}
 
 
 class TranscriptRequest(BaseModel):
@@ -84,6 +127,23 @@ class FrameBoundaryRequest(BaseModel):
     focus_top: float = 0.10
     focus_right: float = 0.98
     focus_bottom: float = 0.90
+
+
+class PanelOcrSupportFrame(BaseModel):
+    frame_file: str | None = None
+    frame_url: str | None = None
+    timestamp: float | None = None
+    offset_seconds: float | None = None
+    label: str | None = None
+
+
+class PanelOcrRequest(BaseModel):
+    frame_file: str | None = None
+    frame_url: str | None = None
+    timestamp: float | None = None
+    support_frames: list[PanelOcrSupportFrame] = []
+    categories: list[str] | None = None
+    layout_hint: str | None = None
 
 
 def job_path(job_id: str) -> Path:
@@ -541,10 +601,12 @@ def build_support_bundle(
             "frame_url": build_public_frame_url(request_base_url, frame_name),
             "label": f"T-{offset:.1f}s",
         })
+    if not support_frames:
+        raise RuntimeError("Nenhum frame de suporte disponível para análise do lote.")
 
-    montage_name = f"frame_{uuid.uuid4().hex}.jpg"
-    montage_path = FRAME_DIR / montage_name
-    build_montage_image(support_frames, montage_path)
+    support_frames.sort(key=lambda frame: frame["offset_seconds"])
+    primary_frame = support_frames[0]
+    fallback_frames = support_frames[1:]
 
     return {
         "support_frames": [
@@ -555,12 +617,390 @@ def build_support_bundle(
                 "frame_url": frame["frame_url"],
                 "label": frame["label"],
             }
-            for frame in support_frames
+            for frame in fallback_frames
         ],
-        "analysis_frame_file": montage_name,
-        "analysis_frame_url": build_public_frame_url(request_base_url, montage_name),
-        "analysis_timestamp": support_frames[-1]["timestamp"] if support_frames else round(boundary_timestamp, 2),
+        "analysis_frame_file": primary_frame["frame_file"],
+        "analysis_frame_url": primary_frame["frame_url"],
+        "analysis_timestamp": primary_frame["timestamp"],
         "analysis_offsets_seconds": [frame["offset_seconds"] for frame in support_frames],
+        "primary_frame_file": primary_frame["frame_file"],
+        "primary_frame_url": primary_frame["frame_url"],
+        "primary_frame_timestamp": primary_frame["timestamp"],
+        "support_frame_count": len(fallback_frames),
+    }
+
+
+def open_frame_image(frame_file: str | None, frame_url: str | None) -> Image.Image:
+    if frame_file:
+        local_path = FRAME_DIR / frame_file
+        if local_path.exists():
+            with Image.open(local_path) as image:
+                return image.convert("RGB")
+
+    if frame_url:
+        response = httpx.get(frame_url, timeout=60)
+        response.raise_for_status()
+        with Image.open(BytesIO(response.content)) as image:
+            return image.convert("RGB")
+
+    raise RuntimeError("Nenhum frame_file ou frame_url válido foi informado para OCR.")
+
+
+def crop_by_ratio(
+    image: Image.Image,
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
+) -> Image.Image:
+    width, height = image.size
+    box = (
+        int(width * left),
+        int(height * top),
+        int(width * right),
+        int(height * bottom),
+    )
+    return image.crop(box)
+
+
+def average_region_rgb(
+    image: Image.Image,
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
+) -> tuple[float, float, float]:
+    region = crop_by_ratio(image, left, top, right, bottom).convert("RGB")
+    pixels = list(region.getdata())
+    if not pixels:
+        return (0.0, 0.0, 0.0)
+    red = sum(pixel[0] for pixel in pixels) / len(pixels)
+    green = sum(pixel[1] for pixel in pixels) / len(pixels)
+    blue = sum(pixel[2] for pixel in pixels) / len(pixels)
+    return (red, green, blue)
+
+
+def detect_panel_layout(image: Image.Image, layout_hint: str | None = None) -> str:
+    if layout_hint and layout_hint in PANEL_LAYOUT_TEMPLATES:
+        return layout_hint
+
+    bottom_band = average_region_rgb(image, 0.05, 0.79, 0.95, 0.95)
+    left_badge = average_region_rgb(image, 0.00, 0.74, 0.16, 0.99)
+
+    bottom_red, bottom_green, bottom_blue = bottom_band
+    badge_red, badge_green, badge_blue = left_badge
+
+    green_bar_detected = (
+        bottom_green > (bottom_red + 18)
+        and bottom_green > (bottom_blue + 10)
+    )
+    light_badge_detected = (
+        badge_red > 170
+        and badge_green > 170
+        and badge_blue > 170
+    )
+
+    if green_bar_detected and light_badge_detected:
+        return "correa_green_bar_v1"
+
+    return "generic_bottom_bar_v1"
+
+
+def enhance_for_ocr(image: Image.Image, *, scale: int = 3, threshold: int | None = None) -> Image.Image:
+    grayscale = ImageOps.grayscale(image)
+    grayscale = ImageOps.autocontrast(grayscale)
+    grayscale = grayscale.resize((grayscale.width * scale, grayscale.height * scale))
+    grayscale = grayscale.filter(ImageFilter.MedianFilter(size=3))
+    grayscale = ImageEnhance.Contrast(grayscale).enhance(2.2)
+    if threshold is not None:
+        grayscale = grayscale.point(lambda p: 255 if p >= threshold else 0)
+    return grayscale
+
+
+def ocr_text_variants(image: Image.Image, configs: list[str], thresholds: list[int | None]) -> list[str]:
+    values: list[str] = []
+    for threshold in thresholds:
+        prepared = enhance_for_ocr(image, threshold=threshold)
+        for config in configs:
+            try:
+                text = pytesseract.image_to_string(prepared, lang="por", config=config)
+            except pytesseract.TesseractNotFoundError as exc:
+                raise RuntimeError("Tesseract OCR não está disponível no container.") from exc
+            cleaned = " ".join((text or "").replace("\n", " ").split())
+            if cleaned:
+                values.append(cleaned)
+    unique: list[str] = []
+    seen = set()
+    for value in values:
+        key = value.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(value.strip())
+    return unique
+
+
+def parse_digits(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+def parse_money_number(text: str) -> float | None:
+    normalized = text.replace("R$", " ").replace("RS", " ").replace("S$", " ")
+    normalized = normalized.replace(" ", "")
+    matches = re.findall(r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d{3,6})", normalized)
+    for match in matches:
+        candidate = match
+        if "," in candidate and "." in candidate:
+            candidate = candidate.replace(".", "").replace(",", ".")
+        elif "," in candidate:
+            candidate = candidate.replace(",", ".")
+        else:
+            candidate = candidate.replace(".", "")
+        try:
+            amount = float(candidate)
+            if 100 <= amount <= 20000:
+                return round(amount, 2)
+        except Exception:
+            continue
+    return None
+
+
+def parse_lot_value(texts: list[str]) -> str:
+    for text in texts:
+        digits = parse_digits(text)
+        if 1 <= len(digits) <= 3:
+            return digits.zfill(3)
+    return ""
+
+
+def parse_info_value(texts: list[str]) -> dict:
+    best = {
+        "quantidade_animais": "",
+        "categoria_animal": "",
+        "peso_medio_kg": "",
+        "raw": "",
+    }
+
+    for text in texts:
+        cleaned = text.replace("|", " ").replace("_", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        quantity_match = re.search(r"^(\d{1,3})\b", cleaned)
+        weight_match = re.search(r"(\d{2,4})\s*kg\b", cleaned, flags=re.IGNORECASE)
+        quantity = quantity_match.group(1) if quantity_match else ""
+        weight = weight_match.group(1) if weight_match else ""
+
+        category = ""
+        if quantity_match and weight_match:
+            category = cleaned[quantity_match.end():weight_match.start()]
+        elif quantity_match:
+            category = cleaned[quantity_match.end():]
+        category = category.replace("-", " ").strip(" -")
+        category = re.sub(r"\s+", " ", category)
+
+        score = int(bool(quantity)) + int(bool(weight)) + int(bool(category))
+        best_score = (
+            int(bool(best["quantidade_animais"])) +
+            int(bool(best["peso_medio_kg"])) +
+            int(bool(best["categoria_animal"]))
+        )
+        if score > best_score:
+            best = {
+                "quantidade_animais": quantity,
+                "categoria_animal": category,
+                "peso_medio_kg": weight,
+                "raw": cleaned,
+            }
+
+    return best
+
+
+def normalize_category(value: str, categories: list[str]) -> str:
+    candidate = re.sub(r"\s+", " ", (value or "").strip())
+    if not candidate:
+        return ""
+
+    candidate_folded = (
+        candidate.lower()
+        .replace("ç", "c")
+        .replace("ã", "a")
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("ê", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ô", "o")
+        .replace("ú", "u")
+    )
+
+    best_match = ""
+    best_score = 0.0
+    for category in categories:
+        category_folded = (
+            category.lower()
+            .replace("ç", "c")
+            .replace("ã", "a")
+            .replace("á", "a")
+            .replace("é", "e")
+            .replace("ê", "e")
+            .replace("í", "i")
+            .replace("ó", "o")
+            .replace("ô", "o")
+            .replace("ú", "u")
+        )
+        score = SequenceMatcher(None, candidate_folded, category_folded).ratio()
+        if score > best_score:
+            best_match = category
+            best_score = score
+
+    if best_score >= 0.72:
+        return best_match
+    return candidate
+
+
+def format_brl(value: float | None) -> str:
+    if value is None:
+        return ""
+    whole = f"{value:,.2f}"
+    whole = whole.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {whole}"
+
+
+def format_decimal_brl(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"R$ {value:.2f}".replace(".", ",")
+
+
+def extract_panel_fields(
+    image: Image.Image,
+    categories: list[str],
+    layout_hint: str | None = None,
+) -> dict:
+    layout_id = detect_panel_layout(image, layout_hint=layout_hint)
+    template = PANEL_LAYOUT_TEMPLATES[layout_id]
+
+    lot_crop = crop_by_ratio(image, *template["lot"])
+    info_crop = crop_by_ratio(image, *template["info"])
+    price_crop = crop_by_ratio(image, *template["price"])
+    price_focus_crop = crop_by_ratio(image, *template["price_focus"])
+
+    lot_texts = ocr_text_variants(
+        lot_crop,
+        configs=[
+            "--psm 7 -c tessedit_char_whitelist=0123456789",
+            "--psm 8 -c tessedit_char_whitelist=0123456789",
+        ],
+        thresholds=[None, 170, 200],
+    )
+    info_texts = ocr_text_variants(
+        info_crop,
+        configs=[
+            "--psm 7",
+            "--psm 6",
+        ],
+        thresholds=[None, 180, 210],
+    )
+    price_texts = ocr_text_variants(
+        price_crop,
+        configs=[
+            "--psm 7",
+            "--psm 6",
+        ],
+        thresholds=[None, 150, 185],
+    )
+    price_focus_texts = ocr_text_variants(
+        price_focus_crop,
+        configs=[
+            "--psm 7",
+            "--psm 8",
+        ],
+        thresholds=[None, 150, 185],
+    )
+
+    info_values = parse_info_value(info_texts)
+    price_values = [parse_money_number(text) for text in (price_focus_texts + price_texts)]
+    price_values = [value for value in price_values if value is not None]
+    price = max(price_values) if price_values else None
+    weight_value = int(info_values["peso_medio_kg"]) if info_values["peso_medio_kg"].isdigit() else None
+    price_per_kg = round(price / weight_value, 2) if price and weight_value else None
+
+    return {
+        "lote": parse_lot_value(lot_texts),
+        "quantidade_animais": info_values["quantidade_animais"],
+        "categoria_animal": normalize_category(info_values["categoria_animal"], categories),
+        "peso_medio_kg": info_values["peso_medio_kg"],
+        "preco_compra_rs": format_brl(price),
+        "preco_kg_rs": format_decimal_brl(price_per_kg),
+        "is_visual_candidate": bool(parse_lot_value(lot_texts)),
+        "frame_kind": "lot_panel_deterministic_ocr",
+        "observacao": "",
+        "layout_id": layout_id,
+        "_ocr_debug": {
+            "layout_id": layout_id,
+            "lot_texts": lot_texts[:3],
+            "info_texts": info_texts[:3],
+            "price_texts": price_texts[:3],
+            "price_focus_texts": price_focus_texts[:3],
+        },
+    }
+
+
+def choose_consensus(values: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for value in values:
+        if not value:
+            continue
+        counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        return ""
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def parse_currency_field(value: str) -> float | None:
+    if not value:
+        return None
+    return parse_money_number(value)
+
+
+def build_ocr_consensus(frame_results: list[dict]) -> dict:
+    lot = choose_consensus([item["lote"] for item in frame_results])
+    quantity = choose_consensus([item["quantidade_animais"] for item in frame_results])
+    category = choose_consensus([item["categoria_animal"] for item in frame_results])
+    weight = choose_consensus([item["peso_medio_kg"] for item in frame_results])
+
+    valid_prices: list[float] = []
+    for item in frame_results:
+        amount = parse_currency_field(item["preco_compra_rs"])
+        if amount is None:
+            continue
+        valid_prices.append(amount)
+    best_price = max(valid_prices) if valid_prices else None
+    layout_id = choose_consensus([item.get("layout_id", "") for item in frame_results])
+
+    weight_value = int(weight) if weight.isdigit() else None
+    price_per_kg = round(best_price / weight_value, 2) if best_price and weight_value else None
+
+    populated_fields = sum(
+        1 for value in [lot, quantity, category, weight, best_price]
+        if value not in ("", None)
+    )
+    confidence = round(min(0.99, 0.45 + (0.11 * populated_fields)), 2) if lot else 0.0
+
+    return {
+        "status": "ok",
+        "is_visual_candidate": bool(lot),
+        "frame_kind": "lot_panel_deterministic_ocr",
+        "lote": lot,
+        "quantidade_animais": quantity,
+        "categoria_animal": category,
+        "peso_medio_kg": weight,
+        "preco_compra_rs": format_brl(best_price),
+        "preco_kg_rs": format_decimal_brl(price_per_kg),
+        "comprador": "",
+        "regiao_destino": "",
+        "confidence": confidence,
+        "observacao": f"ocr_consensus_frames={len(frame_results)}; layout_id={layout_id or 'desconhecido'}",
+        "layout_id": layout_id,
+        "frame_results": frame_results,
     }
 
 
@@ -1048,6 +1488,66 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
                 "video_url": payload.video_url,
                 "video_id": payload.video_id,
                 "worker_job_id": payload.worker_job_id,
+                "version": APP_VERSION,
+            },
+        )
+
+
+@app.post("/frame/panel-ocr")
+async def frame_panel_ocr(payload: PanelOcrRequest):
+    try:
+        categories = payload.categories or PANEL_CATEGORIES
+        sources = [{
+            "frame_file": payload.frame_file,
+            "frame_url": payload.frame_url,
+            "timestamp": payload.timestamp,
+            "label": "primary_frame",
+        }]
+        for frame in payload.support_frames:
+            sources.append({
+                "frame_file": frame.frame_file,
+                "frame_url": frame.frame_url,
+                "timestamp": frame.timestamp,
+                "label": frame.label or "support_frame",
+            })
+
+        frame_results: list[dict] = []
+        for source in sources:
+            if not source["frame_file"] and not source["frame_url"]:
+                continue
+            image = await asyncio.to_thread(
+                open_frame_image,
+                source["frame_file"],
+                source["frame_url"],
+            )
+            try:
+                extracted = await asyncio.to_thread(
+                    extract_panel_fields,
+                    image,
+                    categories,
+                    payload.layout_hint,
+                )
+            finally:
+                image.close()
+
+            frame_results.append({
+                "frame_file": source["frame_file"] or "",
+                "frame_url": source["frame_url"] or "",
+                "timestamp": source["timestamp"],
+                "label": source["label"],
+                **extracted,
+            })
+
+        consensus = build_ocr_consensus(frame_results)
+        consensus["version"] = APP_VERSION
+        return consensus
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": str(e),
                 "version": APP_VERSION,
             },
         )
