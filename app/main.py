@@ -49,6 +49,7 @@ ROOT_DIR = Path("/app")
 FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
 DENO_PATH = Path("/usr/local/bin/deno")
 PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
+PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0, 2.0, 1.2, 0.8, 0.4]
 PANEL_CATEGORIES = [
     "Bezerro",
     "Garrote",
@@ -158,6 +159,19 @@ class PanelOcrBatchItem(BaseModel):
 
 class PanelOcrBatchRequest(BaseModel):
     items: list[PanelOcrBatchItem]
+
+
+class PriceProbeItem(BaseModel):
+    video_url: str
+    video_id: str | None = None
+    boundary_timestamp: float
+    weight_hint: str | None = None
+    layout_hint: str | None = None
+    metadata: dict | None = None
+
+
+class PriceProbeBatchRequest(BaseModel):
+    items: list[PriceProbeItem]
 
 
 def job_path(job_id: str) -> Path:
@@ -778,6 +792,117 @@ def parse_money_number(text: str) -> float | None:
     return None
 
 
+def enhance_price_probe_variants(image: Image.Image) -> list[Image.Image]:
+    grayscale = ImageOps.grayscale(image)
+    grayscale = ImageOps.autocontrast(grayscale)
+    grayscale = grayscale.resize((grayscale.width * 4, grayscale.height * 4))
+    grayscale = grayscale.filter(ImageFilter.MedianFilter(size=3))
+    grayscale = ImageEnhance.Contrast(grayscale).enhance(3.0)
+    grayscale = ImageEnhance.Sharpness(grayscale).enhance(2.0)
+
+    variants = [grayscale]
+    for threshold in (135, 155, 175, 195, 215):
+        binary = grayscale.point(lambda p, t=threshold: 255 if p >= t else 0)
+        variants.append(binary)
+        variants.append(ImageOps.invert(binary))
+    return variants
+
+
+def ocr_price_probe_texts(image: Image.Image) -> list[str]:
+    values: list[str] = []
+    configs = [
+        "--psm 7 -c tessedit_char_whitelist=0123456789.,",
+        "--psm 8 -c tessedit_char_whitelist=0123456789.,",
+        "--psm 13 -c tessedit_char_whitelist=0123456789.,",
+    ]
+    for prepared in enhance_price_probe_variants(image):
+        for config in configs:
+            try:
+                text = pytesseract.image_to_string(prepared, lang="por", config=config)
+            except pytesseract.TesseractNotFoundError as exc:
+                raise RuntimeError("Tesseract OCR nÃ£o estÃ¡ disponÃ­vel no container.") from exc
+            cleaned = " ".join((text or "").replace("\n", " ").split())
+            if cleaned:
+                values.append(cleaned)
+    unique: list[str] = []
+    seen = set()
+    for value in values:
+        key = value.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(value.strip())
+    return unique
+
+
+def extract_price_probe_fields(
+    image: Image.Image,
+    *,
+    weight_hint: str | None = None,
+    layout_hint: str | None = None,
+) -> dict:
+    layout_id = detect_panel_layout(image, layout_hint=layout_hint)
+    template = PANEL_LAYOUT_TEMPLATES[layout_id]
+
+    price_crop = crop_by_ratio(image, *template["price"])
+    price_focus_crop = crop_by_ratio(image, *template["price_focus"])
+
+    price_texts = ocr_price_probe_texts(price_crop)
+    price_focus_texts = ocr_price_probe_texts(price_focus_crop)
+    weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
+
+    candidates: list[float] = []
+    for text in (price_focus_texts + price_texts):
+        value = parse_money_number(text)
+        if value is None:
+            continue
+        if weight_value:
+            per_kg = value / weight_value
+            if not (5 <= per_kg <= 35):
+                continue
+        candidates.append(round(value, 2))
+
+    best_value = max(candidates) if candidates else None
+    return {
+        "layout_id": layout_id,
+        "price_value": best_value,
+        "price_texts": price_texts[:6],
+        "price_focus_texts": price_focus_texts[:6],
+    }
+
+
+def choose_price_probe_track(price_frames: list[dict], weight_value: int | None = None) -> float | None:
+    valid_frames: list[dict] = []
+    for frame in price_frames:
+        value = frame.get("price_value")
+        if value is None:
+            continue
+        if weight_value:
+            per_kg = value / weight_value
+            if not (5 <= per_kg <= 35):
+                continue
+        valid_frames.append(frame)
+
+    if not valid_frames:
+        return None
+
+    valid_frames.sort(key=lambda item: float(item.get("timestamp") or 0))
+    tail = valid_frames[-5:] if len(valid_frames) > 5 else valid_frames
+
+    scored: list[tuple[float, float, float]] = []
+    for index, frame in enumerate(tail):
+        candidate = float(frame["price_value"])
+        support = sum(1 for item in valid_frames if abs(float(item["price_value"]) - candidate) <= 120)
+        tail_support = sum(1 for item in tail if abs(float(item["price_value"]) - candidate) <= 120)
+        later_frames = tail[index + 1:]
+        future_penalty = sum(1 for item in later_frames if float(item["price_value"]) < (candidate - 120))
+        recency = float(frame.get("timestamp") or 0)
+        score = (tail_support * 100) + (support * 25) + recency - (future_penalty * 120)
+        scored.append((score, recency, candidate))
+
+    scored.sort(reverse=True)
+    return scored[0][2] if scored else None
+
+
 def parse_lot_value(texts: list[str]) -> str:
     for text in texts:
         digits = parse_digits(text)
@@ -1072,6 +1197,79 @@ async def run_panel_ocr(
     consensus = build_ocr_consensus(frame_results)
     consensus["version"] = APP_VERSION
     return consensus
+
+
+async def run_price_probe(
+    *,
+    video_url: str,
+    video_id: str | None,
+    boundary_timestamp: float,
+    weight_hint: str | None,
+    layout_hint: str | None,
+) -> dict:
+    video_path = await asyncio.to_thread(download_visual_video, video_url, video_id)
+    timestamps = build_preboundary_timestamps(
+        boundary_timestamp=float(boundary_timestamp),
+        start_time=max(0.0, float(boundary_timestamp) - 8.0),
+        offsets=PRICE_PROBE_OFFSETS,
+    )
+
+    frame_paths: list[Path] = []
+    price_frames: list[dict] = []
+    layout_candidates: list[str] = []
+
+    try:
+        for timestamp in timestamps:
+            frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+            frame_path = FRAME_DIR / frame_name
+            await asyncio.to_thread(
+                extract_frame_from_stream,
+                str(video_path),
+                float(timestamp),
+                frame_path,
+            )
+            frame_paths.append(frame_path)
+
+            with Image.open(frame_path) as source:
+                rgb = source.convert("RGB")
+                extracted = await asyncio.to_thread(
+                    extract_price_probe_fields,
+                    rgb,
+                    weight_hint=weight_hint,
+                    layout_hint=layout_hint,
+                )
+
+            layout_id = extracted.get("layout_id", "")
+            if layout_id:
+                layout_candidates.append(layout_id)
+
+            price_frames.append({
+                "timestamp": float(timestamp),
+                "offset_seconds": round(max(0.0, float(boundary_timestamp) - float(timestamp)), 2),
+                "price_value": extracted.get("price_value"),
+                "layout_id": layout_id,
+                "price_texts": extracted.get("price_texts", []),
+                "price_focus_texts": extracted.get("price_focus_texts", []),
+            })
+
+        weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
+        best_price = choose_price_probe_track(price_frames, weight_value=weight_value)
+        price_per_kg = round(best_price / weight_value, 2) if best_price and weight_value else None
+
+        return {
+            "status": "ok",
+            "preco_compra_rs": format_brl(best_price),
+            "preco_kg_rs": format_decimal_brl(price_per_kg),
+            "layout_id": choose_consensus(layout_candidates),
+            "price_frames": price_frames,
+            "version": APP_VERSION,
+        }
+    finally:
+        for frame_path in frame_paths:
+            try:
+                frame_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def average_hash(image: Image.Image, hash_size: int = 8) -> tuple[int, ...]:
@@ -1610,6 +1808,48 @@ async def frame_panel_ocr_batch(payload: PanelOcrBatchRequest):
                     "metadata": item.metadata or {},
                     "version": APP_VERSION,
                     "frame_results": [],
+                })
+
+        return {
+            "status": "ok",
+            "results": results,
+            "count": len(results),
+            "version": APP_VERSION,
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": str(e),
+                "version": APP_VERSION,
+            },
+        )
+
+
+@app.post("/frame/price-probe-batch")
+async def frame_price_probe_batch(payload: PriceProbeBatchRequest):
+    try:
+        results: list[dict] = []
+        for item in payload.items:
+            try:
+                probe = await run_price_probe(
+                    video_url=item.video_url,
+                    video_id=item.video_id,
+                    boundary_timestamp=item.boundary_timestamp,
+                    weight_hint=item.weight_hint,
+                    layout_hint=item.layout_hint,
+                )
+                if item.metadata:
+                    probe["metadata"] = item.metadata
+                results.append(probe)
+            except Exception as item_error:
+                results.append({
+                    "status": "failed",
+                    "error": str(item_error),
+                    "metadata": item.metadata or {},
+                    "version": APP_VERSION,
                 })
 
         return {
