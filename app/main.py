@@ -861,10 +861,16 @@ def extract_price_probe_fields(
                 continue
         candidates.append(round(value, 2))
 
-    best_value = max(candidates) if candidates else None
+    best_value = None
+    best_support = 0
+    if candidates:
+        counts = Counter(candidates)
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], -item[0]))
+        best_value, best_support = ranked[0]
     return {
         "layout_id": layout_id,
         "price_value": best_value,
+        "price_support": best_support,
         "price_texts": price_texts[:6],
         "price_focus_texts": price_focus_texts[:6],
     }
@@ -888,19 +894,27 @@ def choose_price_probe_track(price_frames: list[dict], weight_value: int | None 
     valid_frames.sort(key=lambda item: float(item.get("timestamp") or 0))
     tail = valid_frames[-5:] if len(valid_frames) > 5 else valid_frames
 
-    scored: list[tuple[float, float, float]] = []
+    scored: list[tuple[float, float, float, float]] = []
     for index, frame in enumerate(tail):
         candidate = float(frame["price_value"])
+        frame_support = int(frame.get("price_support") or 1)
         support = sum(1 for item in valid_frames if abs(float(item["price_value"]) - candidate) <= 120)
         tail_support = sum(1 for item in tail if abs(float(item["price_value"]) - candidate) <= 120)
         later_frames = tail[index + 1:]
         future_penalty = sum(1 for item in later_frames if float(item["price_value"]) < (candidate - 120))
-        recency = float(frame.get("timestamp") or 0)
-        score = (tail_support * 100) + (support * 25) + recency - (future_penalty * 120)
-        scored.append((score, recency, candidate))
+        recency = float(frame.get("timestamp") or 0) / 1000.0
+        score = (
+            (frame_support * 220)
+            + (tail_support * 120)
+            + (support * 50)
+            + candidate
+            + recency
+            - (future_penalty * 100)
+        )
+        scored.append((score, candidate, frame_support, recency))
 
     scored.sort(reverse=True)
-    return scored[0][2] if scored else None
+    return scored[0][1] if scored else None
 
 
 def parse_lot_value(texts: list[str]) -> str:
