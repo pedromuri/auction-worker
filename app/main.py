@@ -87,6 +87,8 @@ PANEL_LAYOUT_TEMPLATES = {
         "price_focus": (0.76, 0.75, 0.995, 0.95),
         "price_probe": (0.72, 0.745, 0.995, 0.885),
         "price_probe_focus": (0.80, 0.745, 0.995, 0.885),
+        "price_probe_alt": (0.69, 0.72, 0.995, 0.90),
+        "price_probe_alt_focus": (0.76, 0.72, 0.995, 0.90),
     },
     "generic_bottom_bar_v1": {
         "lot": (0.00, 0.72, 0.19, 0.995),
@@ -95,6 +97,8 @@ PANEL_LAYOUT_TEMPLATES = {
         "price_focus": (0.77, 0.73, 0.995, 0.95),
         "price_probe": (0.73, 0.725, 0.995, 0.88),
         "price_probe_focus": (0.81, 0.725, 0.995, 0.88),
+        "price_probe_alt": (0.70, 0.705, 0.995, 0.90),
+        "price_probe_alt_focus": (0.78, 0.705, 0.995, 0.90),
     },
 }
 
@@ -906,34 +910,58 @@ def extract_price_probe_fields(
     price_focus_crop = crop_by_ratio(image, *template["price_focus"])
     price_probe_crop = crop_by_ratio(image, *template.get("price_probe", template["price"]))
     price_probe_focus_crop = crop_by_ratio(image, *template.get("price_probe_focus", template["price_focus"]))
+    price_probe_alt_crop = crop_by_ratio(image, *template.get("price_probe_alt", template.get("price_probe", template["price"])))
+    price_probe_alt_focus_crop = crop_by_ratio(image, *template.get("price_probe_alt_focus", template.get("price_probe_focus", template["price_focus"])))
 
     price_texts = ocr_price_probe_texts(price_crop)
     price_focus_texts = ocr_price_probe_texts(price_focus_crop)
     price_probe_texts = ocr_price_probe_texts(price_probe_crop)
     price_probe_focus_texts = ocr_price_probe_texts(price_probe_focus_crop)
+    price_probe_alt_texts: list[str] = []
+    price_probe_alt_focus_texts: list[str] = []
     weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
+
+    def collect_candidates(
+        source_groups: list[tuple[str, list[str], float]],
+        candidate_scores: dict[float, float],
+        candidate_counts: dict[float, int],
+        candidate_sources: dict[float, set[str]],
+    ) -> None:
+        for source_name, texts, source_weight in source_groups:
+            for text in texts:
+                value = parse_money_number(text)
+                if value is None:
+                    continue
+                if weight_value:
+                    per_kg = value / weight_value
+                    if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
+                        continue
+                value = round(value, 2)
+                candidate_scores[value] = candidate_scores.get(value, 0.0) + (score_price_probe_text(text) * source_weight)
+                candidate_counts[value] = candidate_counts.get(value, 0) + 1
+                candidate_sources.setdefault(value, set()).add(source_name)
 
     candidate_scores: dict[float, float] = {}
     candidate_counts: dict[float, int] = {}
     candidate_sources: dict[float, set[str]] = {}
-    for source_name, texts, source_weight in (
+    collect_candidates([
         ("probe_focus", price_probe_focus_texts, 1.85),
         ("probe", price_probe_texts, 1.45),
         ("focus", price_focus_texts, 0.95),
         ("price", price_texts, 0.65),
-    ):
-        for text in texts:
-            value = parse_money_number(text)
-            if value is None:
-                continue
-            if weight_value:
-                per_kg = value / weight_value
-                if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
-                    continue
-            value = round(value, 2)
-            candidate_scores[value] = candidate_scores.get(value, 0.0) + (score_price_probe_text(text) * source_weight)
-            candidate_counts[value] = candidate_counts.get(value, 0) + 1
-            candidate_sources.setdefault(value, set()).add(source_name)
+    ], candidate_scores, candidate_counts, candidate_sources)
+
+    used_alt_probe = False
+    if not candidate_scores:
+        price_probe_alt_texts = ocr_price_probe_texts(price_probe_alt_crop)
+        price_probe_alt_focus_texts = ocr_price_probe_texts(price_probe_alt_focus_crop)
+        collect_candidates([
+            ("probe_alt_focus", price_probe_alt_focus_texts, 1.55),
+            ("probe_alt", price_probe_alt_texts, 1.20),
+            ("focus", price_focus_texts, 0.95),
+            ("price", price_texts, 0.65),
+        ], candidate_scores, candidate_counts, candidate_sources)
+        used_alt_probe = bool(candidate_scores)
 
     best_value = None
     best_support = 0
@@ -957,6 +985,9 @@ def extract_price_probe_fields(
         "price_focus_texts": price_focus_texts[:6],
         "price_probe_texts": price_probe_texts[:6],
         "price_probe_focus_texts": price_probe_focus_texts[:6],
+        "price_probe_alt_texts": price_probe_alt_texts[:6],
+        "price_probe_alt_focus_texts": price_probe_alt_focus_texts[:6],
+        "used_alt_probe": used_alt_probe,
     }
 
 
