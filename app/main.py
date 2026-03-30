@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v19"
+APP_VERSION = "async-v20"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -827,14 +827,27 @@ def ocr_price_probe_texts(image: Image.Image) -> list[str]:
             cleaned = " ".join((text or "").replace("\n", " ").split())
             if cleaned:
                 values.append(cleaned)
-    unique: list[str] = []
-    seen = set()
-    for value in values:
-        key = value.strip().lower()
-        if key and key not in seen:
-            seen.add(key)
-            unique.append(value.strip())
-    return unique
+    return [value.strip() for value in values if value.strip()]
+
+
+def score_price_probe_text(text: str) -> float:
+    cleaned = " ".join((text or "").split()).strip()
+    if not cleaned:
+        return 0.0
+    score = 1.0
+    if re.fullmatch(r"\d{1,2}\.\d{3},\d{2}", cleaned):
+        score += 4.0
+    elif re.fullmatch(r"\d{4},\d{2}", cleaned):
+        score += 3.5
+    elif re.fullmatch(r"\d{4}", cleaned):
+        score += 2.5
+    if cleaned.startswith("7 "):
+        score -= 1.0
+    if len(re.findall(r"\d", cleaned)) > 7:
+        score -= 1.5
+    if any(marker in cleaned for marker in ("253", "533", "799", "252")):
+        score -= 1.0
+    return max(score, 0.25)
 
 
 def extract_price_probe_fields(
@@ -853,7 +866,8 @@ def extract_price_probe_fields(
     price_focus_texts = ocr_price_probe_texts(price_focus_crop)
     weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
 
-    candidates: list[float] = []
+    candidate_scores: dict[float, float] = {}
+    candidate_counts: dict[float, int] = {}
     for text in (price_focus_texts + price_texts):
         value = parse_money_number(text)
         if value is None:
@@ -862,14 +876,23 @@ def extract_price_probe_fields(
             per_kg = value / weight_value
             if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
                 continue
-        candidates.append(round(value, 2))
+        value = round(value, 2)
+        candidate_scores[value] = candidate_scores.get(value, 0.0) + score_price_probe_text(text)
+        candidate_counts[value] = candidate_counts.get(value, 0) + 1
 
     best_value = None
     best_support = 0
-    if candidates:
-        counts = Counter(candidates)
-        ranked = sorted(counts.items(), key=lambda item: (-item[1], -item[0]))
-        best_value, best_support = ranked[0]
+    if candidate_scores:
+        ranked = sorted(
+            candidate_scores.items(),
+            key=lambda item: (
+                -item[1],
+                -candidate_counts.get(item[0], 0),
+                item[0],
+            ),
+        )
+        best_value = ranked[0][0]
+        best_support = candidate_counts.get(best_value, 0)
     return {
         "layout_id": layout_id,
         "price_value": best_value,
@@ -905,18 +928,17 @@ def choose_price_probe_track(price_frames: list[dict], weight_value: int | None 
         tail_support = sum(1 for item in tail if abs(float(item["price_value"]) - candidate) <= 120)
         later_frames = tail[index + 1:]
         future_penalty = sum(1 for item in later_frames if float(item["price_value"]) < (candidate - 120))
-        recency = float(frame.get("timestamp") or 0) / 1000.0
+        recency_rank = index + 1
         score = (
-            (frame_support * 220)
-            + (tail_support * 120)
-            + (support * 50)
-            + candidate
-            + recency
-            - (future_penalty * 100)
+            (frame_support * 260)
+            + (tail_support * 150)
+            + (support * 70)
+            + (recency_rank * 5)
+            - (future_penalty * 160)
         )
-        scored.append((score, candidate, frame_support, recency))
+        scored.append((score, candidate, frame_support, recency_rank))
 
-    scored.sort(reverse=True)
+    scored.sort(key=lambda item: (-item[0], item[1]))
     return scored[0][1] if scored else None
 
 
