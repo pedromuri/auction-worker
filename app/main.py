@@ -1490,15 +1490,11 @@ async def run_price_probe(
 
     try:
         price_frames.extend(await collect_probe_frames(PRICE_PROBE_OFFSETS, "close_window"))
+        price_frames.extend(await collect_probe_frames(PRICE_PROBE_FALLBACK_OFFSETS, "early_fallback"))
 
         weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
         visible_frames = [frame for frame in price_frames if frame.get("panel_visible")]
         best_price = choose_price_probe_track(visible_frames or price_frames, weight_value=weight_value)
-        if best_price is None:
-            fallback_frames = await collect_probe_frames(PRICE_PROBE_FALLBACK_OFFSETS, "early_fallback")
-            price_frames.extend(fallback_frames)
-            visible_frames = [frame for frame in price_frames if frame.get("panel_visible")]
-            best_price = choose_price_probe_track(visible_frames or price_frames, weight_value=weight_value)
         price_per_kg = round(best_price / weight_value, 2) if best_price and weight_value else None
         panel_last_seen_at = max(
             (float(frame.get("timestamp")) for frame in price_frames if frame.get("panel_visible")),
