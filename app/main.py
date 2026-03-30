@@ -53,6 +53,7 @@ PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
 # The isolated price probe works better with a shorter, earlier tail:
 # later frames are noisier while T-6s..T-3s usually contains the stable close price.
 PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0]
+PRICE_PROBE_TIMESTAMP_JITTERS = [0.0, 0.25, -0.25]
 PRICE_PROBE_PER_KG_MIN = 8.0
 PRICE_PROBE_PER_KG_MAX = 23.5
 PANEL_CATEGORIES = [
@@ -1349,44 +1350,63 @@ async def run_price_probe(
 
     try:
         for timestamp in timestamps:
-            frame_name = f"frame_{uuid.uuid4().hex}.jpg"
-            frame_path = FRAME_DIR / frame_name
-            offset_seconds = round(max(0.0, float(boundary_timestamp) - float(timestamp)), 2)
-            try:
-                await asyncio.to_thread(
-                    extract_frame_from_stream,
-                    str(video_path),
-                    float(timestamp),
-                    frame_path,
-                )
-                frame_paths.append(frame_path)
+            base_timestamp = float(timestamp)
+            offset_seconds = round(max(0.0, float(boundary_timestamp) - base_timestamp), 2)
+            extracted_frame = None
+            last_error = None
 
-                with Image.open(frame_path) as source:
-                    rgb = source.convert("RGB")
-                    extracted = await asyncio.to_thread(
-                        extract_price_probe_fields,
-                        rgb,
-                        weight_hint=weight_hint,
-                        layout_hint=layout_hint,
+            for jitter in PRICE_PROBE_TIMESTAMP_JITTERS:
+                probe_timestamp = max(0.0, base_timestamp + jitter)
+                frame_name = f"frame_{uuid.uuid4().hex}.jpg"
+                frame_path = FRAME_DIR / frame_name
+                try:
+                    await asyncio.to_thread(
+                        extract_frame_from_stream,
+                        str(video_path),
+                        probe_timestamp,
+                        frame_path,
                     )
+                    frame_paths.append(frame_path)
 
-                layout_id = extracted.get("layout_id", "")
-                if layout_id:
-                    layout_candidates.append(layout_id)
+                    with Image.open(frame_path) as source:
+                        rgb = source.convert("RGB")
+                        extracted = await asyncio.to_thread(
+                            extract_price_probe_fields,
+                            rgb,
+                            weight_hint=weight_hint,
+                            layout_hint=layout_hint,
+                        )
 
-                price_frames.append({
-                    "timestamp": float(timestamp),
-                    "offset_seconds": offset_seconds,
-                    "price_value": extracted.get("price_value"),
-                    "layout_id": layout_id,
-                    "price_texts": extracted.get("price_texts", []),
-                    "price_focus_texts": extracted.get("price_focus_texts", []),
-                })
-            except Exception as frame_error:
+                    layout_id = extracted.get("layout_id", "")
+                    if layout_id:
+                        layout_candidates.append(layout_id)
+
+                    extracted_frame = {
+                        "timestamp": probe_timestamp,
+                        "base_timestamp": base_timestamp,
+                        "offset_seconds": round(max(0.0, float(boundary_timestamp) - probe_timestamp), 2),
+                        "layout_id": layout_id,
+                        "price_value": extracted.get("price_value"),
+                        "price_texts": extracted.get("price_texts", []),
+                        "price_focus_texts": extracted.get("price_focus_texts", []),
+                        "price_probe_alt_used": extracted.get("used_alt_probe", False),
+                        "timestamp_jitter": jitter,
+                    }
+
+                    if extracted_frame["price_value"] is not None:
+                        break
+                    if extracted_frame["price_texts"] or extracted_frame["price_focus_texts"]:
+                        break
+                except Exception as frame_error:
+                    last_error = frame_error
+
+            if extracted_frame is not None:
+                price_frames.append(extracted_frame)
+            elif last_error is not None:
                 frame_errors.append({
-                    "timestamp": float(timestamp),
+                    "timestamp": base_timestamp,
                     "offset_seconds": offset_seconds,
-                    "error": str(frame_error),
+                    "error": str(last_error),
                 })
 
         weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
