@@ -1314,40 +1314,49 @@ async def run_price_probe(
     frame_paths: list[Path] = []
     price_frames: list[dict] = []
     layout_candidates: list[str] = []
+    frame_errors: list[dict] = []
 
     try:
         for timestamp in timestamps:
             frame_name = f"frame_{uuid.uuid4().hex}.jpg"
             frame_path = FRAME_DIR / frame_name
-            await asyncio.to_thread(
-                extract_frame_from_stream,
-                str(video_path),
-                float(timestamp),
-                frame_path,
-            )
-            frame_paths.append(frame_path)
-
-            with Image.open(frame_path) as source:
-                rgb = source.convert("RGB")
-                extracted = await asyncio.to_thread(
-                    extract_price_probe_fields,
-                    rgb,
-                    weight_hint=weight_hint,
-                    layout_hint=layout_hint,
+            offset_seconds = round(max(0.0, float(boundary_timestamp) - float(timestamp)), 2)
+            try:
+                await asyncio.to_thread(
+                    extract_frame_from_stream,
+                    str(video_path),
+                    float(timestamp),
+                    frame_path,
                 )
+                frame_paths.append(frame_path)
 
-            layout_id = extracted.get("layout_id", "")
-            if layout_id:
-                layout_candidates.append(layout_id)
+                with Image.open(frame_path) as source:
+                    rgb = source.convert("RGB")
+                    extracted = await asyncio.to_thread(
+                        extract_price_probe_fields,
+                        rgb,
+                        weight_hint=weight_hint,
+                        layout_hint=layout_hint,
+                    )
 
-            price_frames.append({
-                "timestamp": float(timestamp),
-                "offset_seconds": round(max(0.0, float(boundary_timestamp) - float(timestamp)), 2),
-                "price_value": extracted.get("price_value"),
-                "layout_id": layout_id,
-                "price_texts": extracted.get("price_texts", []),
-                "price_focus_texts": extracted.get("price_focus_texts", []),
-            })
+                layout_id = extracted.get("layout_id", "")
+                if layout_id:
+                    layout_candidates.append(layout_id)
+
+                price_frames.append({
+                    "timestamp": float(timestamp),
+                    "offset_seconds": offset_seconds,
+                    "price_value": extracted.get("price_value"),
+                    "layout_id": layout_id,
+                    "price_texts": extracted.get("price_texts", []),
+                    "price_focus_texts": extracted.get("price_focus_texts", []),
+                })
+            except Exception as frame_error:
+                frame_errors.append({
+                    "timestamp": float(timestamp),
+                    "offset_seconds": offset_seconds,
+                    "error": str(frame_error),
+                })
 
         weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
         best_price = choose_price_probe_track(price_frames, weight_value=weight_value)
@@ -1359,6 +1368,7 @@ async def run_price_probe(
             "preco_kg_rs": format_decimal_brl(price_per_kg),
             "layout_id": choose_consensus(layout_candidates),
             "price_frames": price_frames,
+            "frame_errors": frame_errors,
             "version": APP_VERSION,
         }
     finally:
