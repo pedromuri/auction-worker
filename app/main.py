@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v20"
+APP_VERSION = "async-v21"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -827,7 +827,15 @@ def ocr_price_probe_texts(image: Image.Image) -> list[str]:
             cleaned = " ".join((text or "").replace("\n", " ").split())
             if cleaned:
                 values.append(cleaned)
-    return [value.strip() for value in values if value.strip()]
+    unique: list[str] = []
+    seen = set()
+    for value in values:
+        cleaned = value.strip()
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            seen.add(key)
+            unique.append(cleaned)
+    return unique
 
 
 def score_price_probe_text(text: str) -> float:
@@ -836,11 +844,13 @@ def score_price_probe_text(text: str) -> float:
         return 0.0
     score = 1.0
     if re.fullmatch(r"\d{1,2}\.\d{3},\d{2}", cleaned):
-        score += 4.0
+        score += 5.0
     elif re.fullmatch(r"\d{4},\d{2}", cleaned):
-        score += 3.5
+        score += 4.0
     elif re.fullmatch(r"\d{4}", cleaned):
-        score += 2.5
+        score += 0.75
+    elif re.fullmatch(r"\d{1,2}\.\d{3}", cleaned):
+        score += 2.0
     if cleaned.startswith("7 "):
         score -= 1.0
     if len(re.findall(r"\d", cleaned)) > 7:
@@ -868,17 +878,23 @@ def extract_price_probe_fields(
 
     candidate_scores: dict[float, float] = {}
     candidate_counts: dict[float, int] = {}
-    for text in (price_focus_texts + price_texts):
-        value = parse_money_number(text)
-        if value is None:
-            continue
-        if weight_value:
-            per_kg = value / weight_value
-            if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
+    candidate_sources: dict[float, set[str]] = {}
+    for source_name, texts, source_weight in (
+        ("focus", price_focus_texts, 1.35),
+        ("price", price_texts, 1.0),
+    ):
+        for text in texts:
+            value = parse_money_number(text)
+            if value is None:
                 continue
-        value = round(value, 2)
-        candidate_scores[value] = candidate_scores.get(value, 0.0) + score_price_probe_text(text)
-        candidate_counts[value] = candidate_counts.get(value, 0) + 1
+            if weight_value:
+                per_kg = value / weight_value
+                if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
+                    continue
+            value = round(value, 2)
+            candidate_scores[value] = candidate_scores.get(value, 0.0) + (score_price_probe_text(text) * source_weight)
+            candidate_counts[value] = candidate_counts.get(value, 0) + 1
+            candidate_sources.setdefault(value, set()).add(source_name)
 
     best_value = None
     best_support = 0
@@ -887,6 +903,7 @@ def extract_price_probe_fields(
             candidate_scores.items(),
             key=lambda item: (
                 -item[1],
+                -len(candidate_sources.get(item[0], set())),
                 -candidate_counts.get(item[0], 0),
                 item[0],
             ),
