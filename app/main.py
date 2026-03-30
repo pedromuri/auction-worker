@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v22"
+APP_VERSION = "async-v23"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -1926,26 +1926,30 @@ async def frame_panel_ocr_batch(payload: PanelOcrBatchRequest):
 @app.post("/frame/price-probe-batch")
 async def frame_price_probe_batch(payload: PriceProbeBatchRequest):
     try:
-        results: list[dict] = []
-        for item in payload.items:
+        semaphore = asyncio.Semaphore(2)
+
+        async def process_item(item: PriceProbeItem) -> dict:
             try:
-                probe = await run_price_probe(
-                    video_url=item.video_url,
-                    video_id=item.video_id,
-                    boundary_timestamp=item.boundary_timestamp,
-                    weight_hint=item.weight_hint,
-                    layout_hint=item.layout_hint,
-                )
-                if item.metadata:
-                    probe["metadata"] = item.metadata
-                results.append(probe)
+                async with semaphore:
+                    probe = await run_price_probe(
+                        video_url=item.video_url,
+                        video_id=item.video_id,
+                        boundary_timestamp=item.boundary_timestamp,
+                        weight_hint=item.weight_hint,
+                        layout_hint=item.layout_hint,
+                    )
+                    if item.metadata:
+                        probe["metadata"] = item.metadata
+                    return probe
             except Exception as item_error:
-                results.append({
+                return {
                     "status": "failed",
                     "error": str(item_error),
                     "metadata": item.metadata or {},
                     "version": APP_VERSION,
-                })
+                }
+
+        results = await asyncio.gather(*(process_item(item) for item in payload.items))
 
         return {
             "status": "ok",
