@@ -15,13 +15,14 @@ import hashlib
 import time
 import re
 from io import BytesIO
+from collections import Counter
 from difflib import SequenceMatcher
 
 import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v17"
+APP_VERSION = "async-v18"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
