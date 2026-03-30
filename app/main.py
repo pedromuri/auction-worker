@@ -50,7 +50,9 @@ ROOT_DIR = Path("/app")
 FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
 DENO_PATH = Path("/usr/local/bin/deno")
 PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
-PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0, 2.0, 1.2, 0.8, 0.4]
+# The isolated price probe works better with a shorter, earlier tail:
+# later frames are noisier while T-6s..T-3s usually contains the stable close price.
+PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0]
 PRICE_PROBE_PER_KG_MIN = 8.0
 PRICE_PROBE_PER_KG_MAX = 23.5
 PANEL_CATEGORIES = [
