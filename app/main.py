@@ -53,6 +53,7 @@ PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
 # The isolated price probe works better with a shorter, earlier tail:
 # later frames are noisier while T-6s..T-3s usually contains the stable close price.
 PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0]
+PRICE_PROBE_FALLBACK_OFFSETS = [14.0, 12.0, 10.0, 8.0]
 PRICE_PROBE_TIMESTAMP_JITTERS = [0.0, 0.25, -0.25]
 PRICE_PROBE_PER_KG_MIN = 8.0
 PRICE_PROBE_PER_KG_MAX = 23.5
@@ -1337,18 +1338,18 @@ async def run_price_probe(
     layout_hint: str | None,
 ) -> dict:
     video_path = await asyncio.to_thread(download_visual_video, video_url, video_id)
-    timestamps = build_preboundary_timestamps(
-        boundary_timestamp=float(boundary_timestamp),
-        start_time=max(0.0, float(boundary_timestamp) - 8.0),
-        offsets=PRICE_PROBE_OFFSETS,
-    )
-
     frame_paths: list[Path] = []
     price_frames: list[dict] = []
     layout_candidates: list[str] = []
     frame_errors: list[dict] = []
 
-    try:
+    async def collect_probe_frames(offsets: list[float], window_label: str) -> list[dict]:
+        timestamps = build_preboundary_timestamps(
+            boundary_timestamp=float(boundary_timestamp),
+            start_time=max(0.0, float(boundary_timestamp) - (max(offsets) + 2.0)),
+            offsets=offsets,
+        )
+        collected_frames: list[dict] = []
         for timestamp in timestamps:
             base_timestamp = float(timestamp)
             offset_seconds = round(max(0.0, float(boundary_timestamp) - base_timestamp), 2)
@@ -1391,6 +1392,7 @@ async def run_price_probe(
                         "price_focus_texts": extracted.get("price_focus_texts", []),
                         "price_probe_alt_used": extracted.get("used_alt_probe", False),
                         "timestamp_jitter": jitter,
+                        "window_label": window_label,
                     }
 
                     if extracted_frame["price_value"] is not None:
@@ -1401,16 +1403,25 @@ async def run_price_probe(
                     last_error = frame_error
 
             if extracted_frame is not None:
-                price_frames.append(extracted_frame)
+                collected_frames.append(extracted_frame)
             elif last_error is not None:
                 frame_errors.append({
                     "timestamp": base_timestamp,
                     "offset_seconds": offset_seconds,
+                    "window_label": window_label,
                     "error": str(last_error),
                 })
+        return collected_frames
+
+    try:
+        price_frames.extend(await collect_probe_frames(PRICE_PROBE_OFFSETS, "close_window"))
 
         weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
         best_price = choose_price_probe_track(price_frames, weight_value=weight_value)
+        if best_price is None:
+            fallback_frames = await collect_probe_frames(PRICE_PROBE_FALLBACK_OFFSETS, "early_fallback")
+            price_frames.extend(fallback_frames)
+            best_price = choose_price_probe_track(price_frames, weight_value=weight_value)
         price_per_kg = round(best_price / weight_value, 2) if best_price and weight_value else None
 
         return {
