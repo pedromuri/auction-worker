@@ -749,6 +749,61 @@ def detect_panel_layout(image: Image.Image, layout_hint: str | None = None) -> s
     return "generic_bottom_bar_v1"
 
 
+def region_color_fraction(
+    image: Image.Image,
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
+    predicate,
+) -> float:
+    region = crop_by_ratio(image, left, top, right, bottom).convert("RGB")
+    pixels = list(region.getdata())
+    if not pixels:
+        return 0.0
+    matched = sum(1 for pixel in pixels if predicate(*pixel))
+    return matched / len(pixels)
+
+
+def assess_panel_visibility(image: Image.Image, layout_id: str) -> dict:
+    template = PANEL_LAYOUT_TEMPLATES[layout_id]
+    band_top = min(template["lot"][1], template["info"][1], template["price"][1])
+    band_bottom = max(template["lot"][3], template["info"][3], template["price"][3])
+
+    green_fraction = region_color_fraction(
+        image,
+        0.02,
+        band_top,
+        0.98,
+        band_bottom,
+        lambda r, g, b: g > (r + 22) and g > (b + 12) and g >= 70,
+    )
+    badge_bright_fraction = region_color_fraction(
+        image,
+        *template["lot"],
+        lambda r, g, b: r >= 170 and g >= 170 and b >= 170,
+    )
+    yellow_fraction = region_color_fraction(
+        image,
+        *template.get("price_probe", template["price"]),
+        lambda r, g, b: r >= 145 and g >= 115 and b <= 120 and r >= g,
+    )
+
+    panel_score = round((green_fraction * 3.0) + (badge_bright_fraction * 2.2) + (yellow_fraction * 1.4), 3)
+    panel_visible = (
+        (green_fraction >= 0.09 and badge_bright_fraction >= 0.05)
+        or panel_score >= 0.42
+    )
+
+    return {
+        "panel_visible": panel_visible,
+        "panel_score": panel_score,
+        "green_fraction": round(green_fraction, 4),
+        "badge_bright_fraction": round(badge_bright_fraction, 4),
+        "yellow_fraction": round(yellow_fraction, 4),
+    }
+
+
 def enhance_for_ocr(image: Image.Image, *, scale: int = 3, threshold: int | None = None) -> Image.Image:
     grayscale = ImageOps.grayscale(image)
     grayscale = ImageOps.autocontrast(grayscale)
@@ -1377,8 +1432,8 @@ async def run_price_probe(
                             weight_hint=weight_hint,
                             layout_hint=layout_hint,
                         )
-
-                    layout_id = extracted.get("layout_id", "")
+                        layout_id = extracted.get("layout_id", "")
+                        panel_visibility = assess_panel_visibility(rgb, layout_id)
                     if layout_id:
                         layout_candidates.append(layout_id)
 
@@ -1393,6 +1448,7 @@ async def run_price_probe(
                         "price_probe_alt_used": extracted.get("used_alt_probe", False),
                         "timestamp_jitter": jitter,
                         "window_label": window_label,
+                        **panel_visibility,
                     }
 
                     if extracted_frame["price_value"] is not None:
@@ -1417,12 +1473,18 @@ async def run_price_probe(
         price_frames.extend(await collect_probe_frames(PRICE_PROBE_OFFSETS, "close_window"))
 
         weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
-        best_price = choose_price_probe_track(price_frames, weight_value=weight_value)
+        visible_frames = [frame for frame in price_frames if frame.get("panel_visible")]
+        best_price = choose_price_probe_track(visible_frames or price_frames, weight_value=weight_value)
         if best_price is None:
             fallback_frames = await collect_probe_frames(PRICE_PROBE_FALLBACK_OFFSETS, "early_fallback")
             price_frames.extend(fallback_frames)
-            best_price = choose_price_probe_track(price_frames, weight_value=weight_value)
+            visible_frames = [frame for frame in price_frames if frame.get("panel_visible")]
+            best_price = choose_price_probe_track(visible_frames or price_frames, weight_value=weight_value)
         price_per_kg = round(best_price / weight_value, 2) if best_price and weight_value else None
+        panel_last_seen_at = max(
+            (float(frame.get("timestamp")) for frame in price_frames if frame.get("panel_visible")),
+            default=None,
+        )
 
         return {
             "status": "ok",
@@ -1431,6 +1493,7 @@ async def run_price_probe(
             "layout_id": choose_consensus(layout_candidates),
             "price_frames": price_frames,
             "frame_errors": frame_errors,
+            "panel_last_seen_at": panel_last_seen_at,
             "version": APP_VERSION,
         }
     finally:
