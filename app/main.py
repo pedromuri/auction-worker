@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v18"
+APP_VERSION = "async-v19"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -51,6 +51,8 @@ FALLBACK_COOKIES_FILE = ROOT_DIR / "cookies.txt"
 DENO_PATH = Path("/usr/local/bin/deno")
 PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
 PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0, 2.0, 1.2, 0.8, 0.4]
+PRICE_PROBE_PER_KG_MIN = 8.0
+PRICE_PROBE_PER_KG_MAX = 23.5
 PANEL_CATEGORIES = [
     "Bezerro",
     "Garrote",
@@ -858,7 +860,7 @@ def extract_price_probe_fields(
             continue
         if weight_value:
             per_kg = value / weight_value
-            if not (5 <= per_kg <= 35):
+            if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
                 continue
         candidates.append(round(value, 2))
 
@@ -885,7 +887,7 @@ def choose_price_probe_track(price_frames: list[dict], weight_value: int | None 
             continue
         if weight_value:
             per_kg = value / weight_value
-            if not (5 <= per_kg <= 35):
+            if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
                 continue
         valid_frames.append(frame)
 
