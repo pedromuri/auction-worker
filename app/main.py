@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v21"
+APP_VERSION = "async-v22"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -83,12 +83,16 @@ PANEL_LAYOUT_TEMPLATES = {
         "info": (0.15, 0.78, 0.68, 0.95),
         "price": (0.67, 0.75, 0.995, 0.95),
         "price_focus": (0.76, 0.75, 0.995, 0.95),
+        "price_probe": (0.72, 0.745, 0.995, 0.885),
+        "price_probe_focus": (0.80, 0.745, 0.995, 0.885),
     },
     "generic_bottom_bar_v1": {
         "lot": (0.00, 0.72, 0.19, 0.995),
         "info": (0.18, 0.76, 0.70, 0.95),
         "price": (0.68, 0.73, 0.995, 0.95),
         "price_focus": (0.77, 0.73, 0.995, 0.95),
+        "price_probe": (0.73, 0.725, 0.995, 0.88),
+        "price_probe_focus": (0.81, 0.725, 0.995, 0.88),
     },
 }
 
@@ -811,6 +815,29 @@ def enhance_price_probe_variants(image: Image.Image) -> list[Image.Image]:
     return variants
 
 
+def extract_yellow_text_mask(image: Image.Image) -> Image.Image:
+    rgb = image.convert("RGB")
+    mask = Image.new("L", rgb.size, 0)
+    pixels_in = rgb.load()
+    pixels_out = mask.load()
+    width, height = rgb.size
+    for y in range(height):
+        for x in range(width):
+            red, green, blue = pixels_in[x, y]
+            is_yellow = (
+                red >= 150
+                and green >= 125
+                and blue <= 170
+                and (red - blue) >= 25
+                and (green - blue) >= 10
+            )
+            pixels_out[x, y] = 255 if is_yellow else 0
+    mask = mask.resize((mask.width * 4, mask.height * 4))
+    mask = mask.filter(ImageFilter.MedianFilter(size=3))
+    mask = ImageEnhance.Contrast(mask).enhance(2.8)
+    return mask
+
+
 def ocr_price_probe_texts(image: Image.Image) -> list[str]:
     values: list[str] = []
     configs = [
@@ -818,7 +845,11 @@ def ocr_price_probe_texts(image: Image.Image) -> list[str]:
         "--psm 8 -c tessedit_char_whitelist=0123456789.,",
         "--psm 13 -c tessedit_char_whitelist=0123456789.,",
     ]
-    for prepared in enhance_price_probe_variants(image):
+    variants = enhance_price_probe_variants(image)
+    yellow_mask = extract_yellow_text_mask(image)
+    variants.append(yellow_mask)
+    variants.append(ImageOps.invert(yellow_mask))
+    for prepared in variants:
         for config in configs:
             try:
                 text = pytesseract.image_to_string(prepared, lang="por", config=config)
@@ -871,17 +902,23 @@ def extract_price_probe_fields(
 
     price_crop = crop_by_ratio(image, *template["price"])
     price_focus_crop = crop_by_ratio(image, *template["price_focus"])
+    price_probe_crop = crop_by_ratio(image, *template.get("price_probe", template["price"]))
+    price_probe_focus_crop = crop_by_ratio(image, *template.get("price_probe_focus", template["price_focus"]))
 
     price_texts = ocr_price_probe_texts(price_crop)
     price_focus_texts = ocr_price_probe_texts(price_focus_crop)
+    price_probe_texts = ocr_price_probe_texts(price_probe_crop)
+    price_probe_focus_texts = ocr_price_probe_texts(price_probe_focus_crop)
     weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
 
     candidate_scores: dict[float, float] = {}
     candidate_counts: dict[float, int] = {}
     candidate_sources: dict[float, set[str]] = {}
     for source_name, texts, source_weight in (
-        ("focus", price_focus_texts, 1.35),
-        ("price", price_texts, 1.0),
+        ("probe_focus", price_probe_focus_texts, 1.85),
+        ("probe", price_probe_texts, 1.45),
+        ("focus", price_focus_texts, 0.95),
+        ("price", price_texts, 0.65),
     ):
         for text in texts:
             value = parse_money_number(text)
@@ -916,6 +953,8 @@ def extract_price_probe_fields(
         "price_support": best_support,
         "price_texts": price_texts[:6],
         "price_focus_texts": price_focus_texts[:6],
+        "price_probe_texts": price_probe_texts[:6],
+        "price_probe_focus_texts": price_probe_focus_texts[:6],
     }
 
 
