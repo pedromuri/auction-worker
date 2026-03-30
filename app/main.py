@@ -54,6 +54,7 @@ PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
 # later frames are noisier while T-6s..T-3s usually contains the stable close price.
 PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0]
 PRICE_PROBE_FALLBACK_OFFSETS = [60.0, 50.0, 40.0, 30.0, 20.0, 14.0, 12.0, 10.0, 8.0]
+PRICE_PROBE_FORWARD_OFFSETS = [-2.0, -4.0, -6.0, -10.0, -15.0, -20.0, -30.0, -45.0, -60.0]
 PRICE_PROBE_TIMESTAMP_JITTERS = [0.0, 0.25, -0.25]
 PRICE_PROBE_PER_KG_MIN = 8.0
 PRICE_PROBE_PER_KG_MAX = 23.5
@@ -574,6 +575,16 @@ def build_preboundary_timestamps(
     return unique_sorted_timestamps(timestamps)
 
 
+def build_relative_timestamps(
+    *,
+    boundary_timestamp: float,
+    offsets: list[float],
+) -> list[float]:
+    safe_boundary = max(0.0, float(boundary_timestamp or 0))
+    timestamps = [max(0.0, safe_boundary - float(offset)) for offset in offsets]
+    return unique_sorted_timestamps(timestamps)
+
+
 def build_montage_image(
     frames: list[dict],
     montage_path: Path,
@@ -963,6 +974,7 @@ def extract_price_probe_fields(
     layout_id = detect_panel_layout(image, layout_hint=layout_hint)
     template = PANEL_LAYOUT_TEMPLATES[layout_id]
 
+    lot_crop = crop_by_ratio(image, *template["lot"])
     price_crop = crop_by_ratio(image, *template["price"])
     price_focus_crop = crop_by_ratio(image, *template["price_focus"])
     price_probe_crop = crop_by_ratio(image, *template.get("price_probe", template["price"]))
@@ -970,6 +982,14 @@ def extract_price_probe_fields(
     price_probe_alt_crop = crop_by_ratio(image, *template.get("price_probe_alt", template.get("price_probe", template["price"])))
     price_probe_alt_focus_crop = crop_by_ratio(image, *template.get("price_probe_alt_focus", template.get("price_probe_focus", template["price_focus"])))
 
+    lot_texts = ocr_text_variants(
+        lot_crop,
+        configs=[
+            "--psm 7 -c tessedit_char_whitelist=0123456789",
+            "--psm 8 -c tessedit_char_whitelist=0123456789",
+        ],
+        thresholds=[None, 170, 200],
+    )
     price_texts = ocr_price_probe_texts(price_crop)
     price_focus_texts = ocr_price_probe_texts(price_focus_crop)
     price_probe_texts = ocr_price_probe_texts(price_probe_crop)
@@ -1036,8 +1056,10 @@ def extract_price_probe_fields(
         best_support = candidate_counts.get(best_value, 0)
     return {
         "layout_id": layout_id,
+        "lot_value": parse_lot_value(lot_texts),
         "price_value": best_value,
         "price_support": best_support,
+        "lot_texts": lot_texts[:4],
         "price_texts": price_texts[:6],
         "price_focus_texts": price_focus_texts[:6],
         "price_probe_texts": price_probe_texts[:6],
@@ -1048,12 +1070,20 @@ def extract_price_probe_fields(
     }
 
 
-def choose_price_probe_track(price_frames: list[dict], weight_value: int | None = None) -> float | None:
+def choose_price_probe_track(
+    price_frames: list[dict],
+    weight_value: int | None = None,
+    lot_hint: str | None = None,
+) -> float | None:
     valid_frames: list[dict] = []
     for frame in price_frames:
         value = frame.get("price_value")
         if value is None:
             continue
+        if lot_hint:
+            lot_value = str(frame.get("lot_value") or "").zfill(3)
+            if lot_value and lot_value != str(lot_hint).zfill(3):
+                continue
         if weight_value:
             per_kg = value / weight_value
             if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
@@ -1410,6 +1440,7 @@ async def run_price_probe(
     boundary_timestamp: float,
     weight_hint: str | None,
     layout_hint: str | None,
+    lot_hint: str | None = None,
 ) -> dict:
     video_path = await asyncio.to_thread(download_visual_video, video_url, video_id)
     frame_paths: list[Path] = []
@@ -1418,9 +1449,8 @@ async def run_price_probe(
     frame_errors: list[dict] = []
 
     async def collect_probe_frames(offsets: list[float], window_label: str) -> list[dict]:
-        timestamps = build_preboundary_timestamps(
+        timestamps = build_relative_timestamps(
             boundary_timestamp=float(boundary_timestamp),
-            start_time=max(0.0, float(boundary_timestamp) - (max(offsets) + 2.0)),
             offsets=offsets,
         )
         collected_frames: list[dict] = []
@@ -1461,7 +1491,9 @@ async def run_price_probe(
                         "base_timestamp": base_timestamp,
                         "offset_seconds": round(max(0.0, float(boundary_timestamp) - probe_timestamp), 2),
                         "layout_id": layout_id,
+                        "lot_value": extracted.get("lot_value", ""),
                         "price_value": extracted.get("price_value"),
+                        "lot_texts": extracted.get("lot_texts", []),
                         "price_texts": extracted.get("price_texts", []),
                         "price_focus_texts": extracted.get("price_focus_texts", []),
                         "price_probe_alt_used": extracted.get("used_alt_probe", False),
@@ -1493,8 +1525,14 @@ async def run_price_probe(
         price_frames.extend(await collect_probe_frames(PRICE_PROBE_FALLBACK_OFFSETS, "early_fallback"))
 
         weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
+        price_frames.extend(await collect_probe_frames(PRICE_PROBE_FORWARD_OFFSETS, "forward_window"))
+
         visible_frames = [frame for frame in price_frames if frame.get("panel_visible")]
-        best_price = choose_price_probe_track(visible_frames or price_frames, weight_value=weight_value)
+        best_price = choose_price_probe_track(
+            visible_frames or price_frames,
+            weight_value=weight_value,
+            lot_hint=lot_hint,
+        )
         price_per_kg = round(best_price / weight_value, 2) if best_price and weight_value else None
         panel_last_seen_at = max(
             (float(frame.get("timestamp")) for frame in price_frames if frame.get("panel_visible")),
@@ -2089,6 +2127,7 @@ async def frame_price_probe_batch(payload: PriceProbeBatchRequest):
                         boundary_timestamp=item.boundary_timestamp,
                         weight_hint=item.weight_hint,
                         layout_hint=item.layout_hint,
+                        lot_hint=((item.metadata or {}).get("lote") if item.metadata else None),
                     )
                     if item.metadata:
                         probe["metadata"] = item.metadata
