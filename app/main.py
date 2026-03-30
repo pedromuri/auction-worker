@@ -53,7 +53,7 @@ PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
 # The isolated price probe works better with a shorter, earlier tail:
 # later frames are noisier while T-6s..T-3s usually contains the stable close price.
 PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0]
-PRICE_PROBE_FALLBACK_OFFSETS = [14.0, 12.0, 10.0, 8.0]
+PRICE_PROBE_FALLBACK_OFFSETS = [60.0, 50.0, 40.0, 30.0, 20.0, 14.0, 12.0, 10.0, 8.0]
 PRICE_PROBE_TIMESTAMP_JITTERS = [0.0, 0.25, -0.25]
 PRICE_PROBE_PER_KG_MIN = 8.0
 PRICE_PROBE_PER_KG_MAX = 23.5
@@ -1062,6 +1062,25 @@ def choose_price_probe_track(price_frames: list[dict], weight_value: int | None 
 
     if not valid_frames:
         return None
+
+    # Final auction price should be the highest stable visible value before the panel disappears.
+    # Prefer the highest value cluster that repeats across frames; this protects us from late low values
+    # when the boundary timestamp is delayed, while still ignoring isolated OCR spikes.
+    clustered: list[tuple[float, int, int]] = []
+    seen_cluster_keys: set[int] = set()
+    for frame in valid_frames:
+        candidate = float(frame["price_value"])
+        cluster_frames = [item for item in valid_frames if abs(float(item["price_value"]) - candidate) <= 120]
+        support = len(cluster_frames)
+        unique_timestamps = len({round(float(item.get("timestamp") or 0), 2) for item in cluster_frames})
+        cluster_key = int(round(candidate))
+        if support >= 2 and cluster_key not in seen_cluster_keys:
+            seen_cluster_keys.add(cluster_key)
+            clustered.append((candidate, support, unique_timestamps))
+
+    if clustered:
+        clustered.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+        return clustered[0][0]
 
     valid_frames.sort(key=lambda item: float(item.get("timestamp") or 0))
     tail = valid_frames[-5:] if len(valid_frames) > 5 else valid_frames
