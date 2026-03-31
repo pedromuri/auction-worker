@@ -54,7 +54,7 @@ PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
 # later frames are noisier while T-6s..T-3s usually contains the stable close price.
 PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0]
 PRICE_PROBE_FALLBACK_OFFSETS = [60.0, 50.0, 40.0, 30.0, 20.0, 14.0, 12.0, 10.0, 8.0]
-PRICE_PROBE_FORWARD_OFFSETS = [-2.0, -4.0, -6.0, -10.0, -15.0, -20.0, -30.0, -45.0, -60.0]
+PRICE_PROBE_FORWARD_OFFSETS = [-4.0, -12.0, -20.0, -30.0]
 PRICE_PROBE_TIMESTAMP_JITTERS = [0.0, 0.25, -0.25]
 PRICE_PROBE_PER_KG_MIN = 8.0
 PRICE_PROBE_PER_KG_MAX = 23.5
