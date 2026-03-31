@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v23"
+APP_VERSION = "async-v24"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -1441,8 +1441,9 @@ async def run_price_probe(
     weight_hint: str | None,
     layout_hint: str | None,
     lot_hint: str | None = None,
+    video_path: Path | None = None,
 ) -> dict:
-    video_path = await asyncio.to_thread(download_visual_video, video_url, video_id)
+    resolved_video_path = video_path or await asyncio.to_thread(download_visual_video, video_url, video_id)
     frame_paths: list[Path] = []
     price_frames: list[dict] = []
     layout_candidates: list[str] = []
@@ -1467,7 +1468,7 @@ async def run_price_probe(
                 try:
                     await asyncio.to_thread(
                         extract_frame_from_stream,
-                        str(video_path),
+                        str(resolved_video_path),
                         probe_timestamp,
                         frame_path,
                     )
@@ -2124,11 +2125,16 @@ async def frame_panel_ocr_batch(payload: PanelOcrBatchRequest):
 @app.post("/frame/price-probe-batch")
 async def frame_price_probe_batch(payload: PriceProbeBatchRequest):
     try:
-        semaphore = asyncio.Semaphore(2)
+        grouped_items: dict[tuple[str, str], list[PriceProbeItem]] = {}
+        for item in payload.items:
+            key = (item.video_url, item.video_id or "")
+            grouped_items.setdefault(key, []).append(item)
 
-        async def process_item(item: PriceProbeItem) -> dict:
-            try:
-                async with semaphore:
+        results: list[dict] = []
+        for (video_url, video_id), items in grouped_items.items():
+            shared_video_path = await asyncio.to_thread(download_visual_video, video_url, video_id or None)
+            for item in items:
+                try:
                     probe = await run_price_probe(
                         video_url=item.video_url,
                         video_id=item.video_id,
@@ -2136,19 +2142,18 @@ async def frame_price_probe_batch(payload: PriceProbeBatchRequest):
                         weight_hint=item.weight_hint,
                         layout_hint=item.layout_hint,
                         lot_hint=((item.metadata or {}).get("lote") if item.metadata else None),
+                        video_path=shared_video_path,
                     )
                     if item.metadata:
                         probe["metadata"] = item.metadata
-                    return probe
-            except Exception as item_error:
-                return {
-                    "status": "failed",
-                    "error": str(item_error),
-                    "metadata": item.metadata or {},
-                    "version": APP_VERSION,
-                }
-
-        results = await asyncio.gather(*(process_item(item) for item in payload.items))
+                    results.append(probe)
+                except Exception as item_error:
+                    results.append({
+                        "status": "failed",
+                        "error": str(item_error),
+                        "metadata": item.metadata or {},
+                        "version": APP_VERSION,
+                    })
 
         return {
             "status": "ok",
