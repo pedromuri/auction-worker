@@ -1521,11 +1521,19 @@ async def run_price_probe(
         return collected_frames
 
     try:
-        price_frames.extend(await collect_probe_frames(PRICE_PROBE_OFFSETS, "close_window"))
-        price_frames.extend(await collect_probe_frames(PRICE_PROBE_FALLBACK_OFFSETS, "early_fallback"))
+        close_frames = await collect_probe_frames(PRICE_PROBE_OFFSETS, "close_window")
+        price_frames.extend(close_frames)
+
+        close_visible_frames = [frame for frame in close_frames if frame.get("panel_visible")]
+        close_prices = [frame.get("price_value") for frame in close_visible_frames if frame.get("price_value") is not None]
+
+        if not close_visible_frames or not close_prices:
+            price_frames.extend(await collect_probe_frames(PRICE_PROBE_FALLBACK_OFFSETS, "early_fallback"))
+
+        if close_visible_frames and close_visible_frames[-1].get("panel_visible"):
+            price_frames.extend(await collect_probe_frames(PRICE_PROBE_FORWARD_OFFSETS, "forward_window"))
 
         weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
-        price_frames.extend(await collect_probe_frames(PRICE_PROBE_FORWARD_OFFSETS, "forward_window"))
 
         visible_frames = [frame for frame in price_frames if frame.get("panel_visible")]
         best_price = choose_price_probe_track(
