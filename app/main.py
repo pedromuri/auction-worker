@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v24"
+APP_VERSION = "async-v25"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -1712,6 +1712,68 @@ async def process_job(job_id: str, video_url: str, video_id: str):
         })
 
 
+def model_dump_compat(model) -> dict:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
+def price_probe_job_id(item: PriceProbeItem) -> str:
+    metadata = item.metadata or {}
+    payload = {
+        "video_url": item.video_url,
+        "video_id": item.video_id or "",
+        "boundary_timestamp": round(float(item.boundary_timestamp), 3),
+        "weight_hint": item.weight_hint or "",
+        "layout_hint": item.layout_hint or "",
+        "lote": str(metadata.get("lote") or "").strip(),
+        "tracking_id": str(metadata.get("tracking_id") or "").strip(),
+        "execution_id": str(metadata.get("execution_id") or "").strip(),
+    }
+    digest = hashlib.sha1(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"price-probe-{digest}"
+
+
+async def process_price_probe_job(job_id: str, item_data: dict):
+    metadata = item_data.get("metadata") or {}
+    try:
+        save_job(job_id, {
+            "job_id": job_id,
+            "status": "processing",
+            "metadata": metadata,
+            "version": APP_VERSION,
+        })
+
+        probe = await run_price_probe(
+            video_url=str(item_data.get("video_url") or "").strip(),
+            video_id=(str(item_data.get("video_id") or "").strip() or None),
+            boundary_timestamp=float(item_data.get("boundary_timestamp") or 0),
+            weight_hint=(str(item_data.get("weight_hint") or "").strip() or None),
+            layout_hint=(str(item_data.get("layout_hint") or "").strip() or None),
+            lot_hint=(str(metadata.get("lote") or "").strip() or None),
+        )
+        if metadata:
+            probe["metadata"] = metadata
+
+        save_job(job_id, {
+            "job_id": job_id,
+            "status": "finished",
+            "metadata": metadata,
+            "result": probe,
+            "version": APP_VERSION,
+        })
+    except Exception as e:
+        save_job(job_id, {
+            "job_id": job_id,
+            "status": "failed",
+            "metadata": metadata,
+            "error": str(e),
+            "version": APP_VERSION,
+        })
+
+
 @app.get("/health")
 async def health():
     return {
@@ -2123,37 +2185,51 @@ async def frame_panel_ocr_batch(payload: PanelOcrBatchRequest):
 
 
 @app.post("/frame/price-probe-batch")
-async def frame_price_probe_batch(payload: PriceProbeBatchRequest):
+async def frame_price_probe_batch(payload: PriceProbeBatchRequest, background_tasks: BackgroundTasks):
     try:
-        grouped_items: dict[tuple[str, str], list[PriceProbeItem]] = {}
-        for item in payload.items:
-            key = (item.video_url, item.video_id or "")
-            grouped_items.setdefault(key, []).append(item)
-
         results: list[dict] = []
-        for (video_url, video_id), items in grouped_items.items():
-            shared_video_path = await asyncio.to_thread(download_visual_video, video_url, video_id or None)
-            for item in items:
-                try:
-                    probe = await run_price_probe(
-                        video_url=item.video_url,
-                        video_id=item.video_id,
-                        boundary_timestamp=item.boundary_timestamp,
-                        weight_hint=item.weight_hint,
-                        layout_hint=item.layout_hint,
-                        lot_hint=((item.metadata or {}).get("lote") if item.metadata else None),
-                        video_path=shared_video_path,
-                    )
-                    if item.metadata:
-                        probe["metadata"] = item.metadata
-                    results.append(probe)
-                except Exception as item_error:
-                    results.append({
-                        "status": "failed",
-                        "error": str(item_error),
-                        "metadata": item.metadata or {},
-                        "version": APP_VERSION,
-                    })
+        for item in payload.items:
+            metadata = item.metadata or {}
+            job_id = price_probe_job_id(item)
+            job = load_job(job_id)
+
+            if job and job.get("status") == "finished":
+                result = dict(job.get("result") or {})
+                result["job_id"] = job_id
+                result["metadata"] = metadata or result.get("metadata") or {}
+                result["version"] = APP_VERSION
+                results.append(result)
+                continue
+
+            if job and job.get("status") == "failed":
+                results.append({
+                    "status": "failed",
+                    "error": str(job.get("error") or ""),
+                    "job_id": job_id,
+                    "metadata": metadata,
+                    "version": APP_VERSION,
+                })
+                continue
+
+            status = "queued"
+            if job and job.get("status") in {"queued", "processing"}:
+                status = job.get("status")
+            else:
+                item_data = model_dump_compat(item)
+                save_job(job_id, {
+                    "job_id": job_id,
+                    "status": "queued",
+                    "metadata": metadata,
+                    "version": APP_VERSION,
+                })
+                background_tasks.add_task(process_price_probe_job, job_id, item_data)
+
+            results.append({
+                "status": status,
+                "job_id": job_id,
+                "metadata": metadata,
+                "version": APP_VERSION,
+            })
 
         return {
             "status": "ok",
