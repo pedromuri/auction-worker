@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v25"
+APP_VERSION = "async-v26"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -994,8 +994,8 @@ def extract_price_probe_fields(
     price_focus_texts = ocr_price_probe_texts(price_focus_crop)
     price_probe_texts = ocr_price_probe_texts(price_probe_crop)
     price_probe_focus_texts = ocr_price_probe_texts(price_probe_focus_crop)
-    price_probe_alt_texts: list[str] = []
-    price_probe_alt_focus_texts: list[str] = []
+    price_probe_alt_texts = ocr_price_probe_texts(price_probe_alt_crop)
+    price_probe_alt_focus_texts = ocr_price_probe_texts(price_probe_alt_focus_crop)
     weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
 
     def collect_candidates(
@@ -1024,14 +1024,14 @@ def extract_price_probe_fields(
     collect_candidates([
         ("probe_focus", price_probe_focus_texts, 1.85),
         ("probe", price_probe_texts, 1.45),
+        ("probe_alt_focus", price_probe_alt_focus_texts, 1.05),
+        ("probe_alt", price_probe_alt_texts, 0.85),
         ("focus", price_focus_texts, 0.95),
         ("price", price_texts, 0.65),
     ], candidate_scores, candidate_counts, candidate_sources)
 
     used_alt_probe = False
-    if not candidate_scores:
-        price_probe_alt_texts = ocr_price_probe_texts(price_probe_alt_crop)
-        price_probe_alt_focus_texts = ocr_price_probe_texts(price_probe_alt_focus_crop)
+    if not candidate_scores and (price_probe_alt_texts or price_probe_alt_focus_texts):
         collect_candidates([
             ("probe_alt_focus", price_probe_alt_focus_texts, 1.55),
             ("probe_alt", price_probe_alt_texts, 1.20),
@@ -1054,11 +1054,15 @@ def extract_price_probe_fields(
         )
         best_value = ranked[0][0]
         best_support = candidate_counts.get(best_value, 0)
+    best_score = candidate_scores.get(best_value, 0.0) if best_value is not None else 0.0
+    best_source_count = len(candidate_sources.get(best_value, set())) if best_value is not None else 0
     return {
         "layout_id": layout_id,
         "lot_value": parse_lot_value(lot_texts),
         "price_value": best_value,
         "price_support": best_support,
+        "price_score": round(best_score, 3),
+        "price_source_count": best_source_count,
         "lot_texts": lot_texts[:4],
         "price_texts": price_texts[:6],
         "price_focus_texts": price_focus_texts[:6],
@@ -1093,23 +1097,28 @@ def choose_price_probe_track(
     if not valid_frames:
         return None
 
-    # Final auction price should be the highest stable visible value before the panel disappears.
-    # Prefer the highest value cluster that repeats across frames; this protects us from late low values
-    # when the boundary timestamp is delayed, while still ignoring isolated OCR spikes.
-    clustered: list[tuple[float, int, int]] = []
+    # Final auction price should be the last stable visible value before the panel disappears.
+    # A later repeated cluster is usually more trustworthy than an earlier larger number,
+    # which helps avoid OCR inflations like 7200 -> 9200.
+    clustered: list[tuple[float, int, float, int, float, float]] = []
     seen_cluster_keys: set[int] = set()
+    tail = valid_frames[-5:] if len(valid_frames) > 5 else valid_frames
     for frame in valid_frames:
         candidate = float(frame["price_value"])
         cluster_frames = [item for item in valid_frames if abs(float(item["price_value"]) - candidate) <= 120]
         support = len(cluster_frames)
+        latest_timestamp = max(float(item.get("timestamp") or 0) for item in cluster_frames)
         unique_timestamps = len({round(float(item.get("timestamp") or 0), 2) for item in cluster_frames})
+        tail_support = sum(1 for item in tail if abs(float(item["price_value"]) - candidate) <= 120)
+        avg_frame_support = sum(float(item.get("price_support") or 1) for item in cluster_frames) / max(1, support)
+        avg_score = sum(float(item.get("price_score") or 0) for item in cluster_frames) / max(1, support)
         cluster_key = int(round(candidate))
         if support >= 2 and cluster_key not in seen_cluster_keys:
             seen_cluster_keys.add(cluster_key)
-            clustered.append((candidate, support, unique_timestamps))
+            clustered.append((candidate, tail_support, latest_timestamp, support, avg_frame_support, avg_score))
 
     if clustered:
-        clustered.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+        clustered.sort(key=lambda item: (-item[1], -item[2], -item[3], -item[4], -item[5], -item[0]))
         return clustered[0][0]
 
     valid_frames.sort(key=lambda item: float(item.get("timestamp") or 0))
@@ -1121,6 +1130,7 @@ def choose_price_probe_track(
         frame_support = int(frame.get("price_support") or 1)
         support = sum(1 for item in valid_frames if abs(float(item["price_value"]) - candidate) <= 120)
         tail_support = sum(1 for item in tail if abs(float(item["price_value"]) - candidate) <= 120)
+        frame_score = float(frame.get("price_score") or 0)
         later_frames = tail[index + 1:]
         future_penalty = sum(1 for item in later_frames if float(item["price_value"]) < (candidate - 120))
         recency_rank = index + 1
@@ -1128,12 +1138,13 @@ def choose_price_probe_track(
             (frame_support * 260)
             + (tail_support * 150)
             + (support * 70)
+            + (frame_score * 12)
             + (recency_rank * 5)
             - (future_penalty * 160)
         )
         scored.append((score, candidate, frame_support, recency_rank))
 
-    scored.sort(key=lambda item: (-item[0], item[1]))
+    scored.sort(key=lambda item: (-item[0], -item[1]))
     return scored[0][1] if scored else None
 
 
