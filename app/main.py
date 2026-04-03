@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v27"
+APP_VERSION = "async-v28"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -1721,6 +1721,7 @@ def model_dump_compat(model) -> dict:
 def price_probe_job_id(item: PriceProbeItem) -> str:
     metadata = item.metadata or {}
     payload = {
+        "app_version": APP_VERSION,
         "video_url": item.video_url,
         "video_id": item.video_id or "",
         "boundary_timestamp": round(float(item.boundary_timestamp), 3),
