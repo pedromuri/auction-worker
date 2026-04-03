@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v30"
+APP_VERSION = "async-v31"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -92,6 +92,8 @@ PANEL_LAYOUT_TEMPLATES = {
         "price_probe_focus": (0.80, 0.745, 0.995, 0.885),
         "price_probe_alt": (0.69, 0.72, 0.995, 0.90),
         "price_probe_alt_focus": (0.76, 0.72, 0.995, 0.90),
+        "price_probe_alt2": (0.64, 0.70, 0.995, 0.91),
+        "price_probe_alt2_focus": (0.72, 0.70, 0.995, 0.91),
     },
     "generic_bottom_bar_v1": {
         "lot": (0.00, 0.72, 0.19, 0.995),
@@ -102,6 +104,8 @@ PANEL_LAYOUT_TEMPLATES = {
         "price_probe_focus": (0.81, 0.725, 0.995, 0.88),
         "price_probe_alt": (0.70, 0.705, 0.995, 0.90),
         "price_probe_alt_focus": (0.78, 0.705, 0.995, 0.90),
+        "price_probe_alt2": (0.66, 0.69, 0.995, 0.91),
+        "price_probe_alt2_focus": (0.74, 0.69, 0.995, 0.91),
     },
 }
 
@@ -981,6 +985,8 @@ def extract_price_probe_fields(
     price_probe_focus_crop = crop_by_ratio(image, *template.get("price_probe_focus", template["price_focus"]))
     price_probe_alt_crop = crop_by_ratio(image, *template.get("price_probe_alt", template.get("price_probe", template["price"])))
     price_probe_alt_focus_crop = crop_by_ratio(image, *template.get("price_probe_alt_focus", template.get("price_probe_focus", template["price_focus"])))
+    price_probe_alt2_crop = crop_by_ratio(image, *template.get("price_probe_alt2", template.get("price_probe_alt", template.get("price_probe", template["price"]))))
+    price_probe_alt2_focus_crop = crop_by_ratio(image, *template.get("price_probe_alt2_focus", template.get("price_probe_alt_focus", template.get("price_probe_focus", template["price_focus"]))))
 
     lot_texts = ocr_text_variants(
         lot_crop,
@@ -996,6 +1002,8 @@ def extract_price_probe_fields(
     price_probe_focus_texts = ocr_price_probe_texts(price_probe_focus_crop)
     price_probe_alt_texts: list[str] = []
     price_probe_alt_focus_texts: list[str] = []
+    price_probe_alt2_texts: list[str] = []
+    price_probe_alt2_focus_texts: list[str] = []
     weight_value = int(weight_hint) if str(weight_hint or "").isdigit() else None
 
     def collect_candidates(
@@ -1040,6 +1048,19 @@ def extract_price_probe_fields(
         ], candidate_scores, candidate_counts, candidate_sources)
         used_alt_probe = bool(candidate_scores)
 
+    if not candidate_scores:
+        price_probe_alt2_texts = ocr_price_probe_texts(price_probe_alt2_crop)
+        price_probe_alt2_focus_texts = ocr_price_probe_texts(price_probe_alt2_focus_crop)
+        collect_candidates([
+            ("probe_alt2_focus", price_probe_alt2_focus_texts, 1.45),
+            ("probe_alt2", price_probe_alt2_texts, 1.10),
+            ("probe_alt_focus", price_probe_alt_focus_texts, 1.00),
+            ("probe_alt", price_probe_alt_texts, 0.85),
+            ("focus", price_focus_texts, 0.95),
+            ("price", price_texts, 0.65),
+        ], candidate_scores, candidate_counts, candidate_sources)
+        used_alt_probe = bool(candidate_scores)
+
     best_value = None
     best_support = 0
     if candidate_scores:
@@ -1066,6 +1087,8 @@ def extract_price_probe_fields(
         "price_probe_focus_texts": price_probe_focus_texts[:6],
         "price_probe_alt_texts": price_probe_alt_texts[:6],
         "price_probe_alt_focus_texts": price_probe_alt_focus_texts[:6],
+        "price_probe_alt2_texts": price_probe_alt2_texts[:6],
+        "price_probe_alt2_focus_texts": price_probe_alt2_focus_texts[:6],
         "used_alt_probe": used_alt_probe,
     }
 
@@ -1093,24 +1116,44 @@ def choose_price_probe_track(
     if not valid_frames:
         return None
 
-    # Final auction price should be the highest stable visible value before the panel disappears.
-    # Prefer the highest value cluster that repeats across frames; this protects us from late low values
-    # when the boundary timestamp is delayed, while still ignoring isolated OCR spikes.
-    clustered: list[tuple[float, int, int]] = []
-    seen_cluster_keys: set[int] = set()
-    for frame in valid_frames:
+    # Build clusters from repeated visible values, then prefer the most stable late cluster.
+    clustered: list[tuple[float, float, int, int, float, float]] = []
+    used_frames: set[int] = set()
+    ordered_frames = sorted(valid_frames, key=lambda item: float(item.get("timestamp") or 0))
+    for frame in ordered_frames:
+        frame_id = id(frame)
+        if frame_id in used_frames:
+            continue
         candidate = float(frame["price_value"])
-        cluster_frames = [item for item in valid_frames if abs(float(item["price_value"]) - candidate) <= 120]
+        cluster_frames = [item for item in ordered_frames if abs(float(item["price_value"]) - candidate) <= 120]
         support = len(cluster_frames)
+        if support < 2:
+            continue
+        for item in cluster_frames:
+            used_frames.add(id(item))
+        latest_frame = max(cluster_frames, key=lambda item: float(item.get("timestamp") or 0))
+        latest_ts = float(latest_frame.get("timestamp") or 0)
         unique_timestamps = len({round(float(item.get("timestamp") or 0), 2) for item in cluster_frames})
-        cluster_key = int(round(candidate))
-        if support >= 2 and cluster_key not in seen_cluster_keys:
-            seen_cluster_keys.add(cluster_key)
-            clustered.append((candidate, support, unique_timestamps))
+        avg_frame_support = sum(float(item.get("price_support") or 1) for item in cluster_frames) / support
+        avg_panel_score = sum(float(item.get("panel_score") or 0) for item in cluster_frames) / support
+        cluster_value = float(latest_frame["price_value"])
+        score = (
+            (support * 240)
+            + (unique_timestamps * 140)
+            + (avg_frame_support * 120)
+            + (avg_panel_score * 80)
+            + (latest_ts / 10.0)
+        )
+        clustered.append((score, cluster_value, support, unique_timestamps, avg_frame_support, latest_ts))
 
     if clustered:
-        clustered.sort(key=lambda item: (-item[0], -item[1], -item[2]))
-        return clustered[0][0]
+        clustered.sort(key=lambda item: (-item[0], -item[5], -item[1]))
+        top_score, top_value, top_support, _, _, top_ts = clustered[0]
+        if len(clustered) > 1:
+            _, second_value, second_support, _, _, second_ts = clustered[1]
+            if top_value > (second_value + 1000) and top_support <= second_support and top_ts <= (second_ts + 4):
+                return second_value
+        return top_value
 
     valid_frames.sort(key=lambda item: float(item.get("timestamp") or 0))
     tail = valid_frames[-5:] if len(valid_frames) > 5 else valid_frames
