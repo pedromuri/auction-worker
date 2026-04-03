@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v28"
+APP_VERSION = "async-v29"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -2191,8 +2191,32 @@ async def frame_price_probe_batch(payload: PriceProbeBatchRequest, background_ta
         results: list[dict] = []
         for item in payload.items:
             metadata = item.metadata or {}
+            force_sync = str(metadata.get("force_sync") or "").strip().lower() in {"1", "true", "yes", "sync"}
             job_id = price_probe_job_id(item)
             job = load_job(job_id)
+
+            if force_sync:
+                probe = await run_price_probe(
+                    video_url=item.video_url,
+                    video_id=item.video_id,
+                    boundary_timestamp=float(item.boundary_timestamp),
+                    weight_hint=item.weight_hint,
+                    layout_hint=item.layout_hint,
+                    lot_hint=(str(metadata.get("lote") or "").strip() or None),
+                )
+                if metadata:
+                    probe["metadata"] = metadata
+                probe["job_id"] = job_id
+                probe["version"] = APP_VERSION
+                save_job(job_id, {
+                    "job_id": job_id,
+                    "status": "finished",
+                    "metadata": metadata,
+                    "result": probe,
+                    "version": APP_VERSION,
+                })
+                results.append(probe)
+                continue
 
             if job and job.get("status") == "finished":
                 result = dict(job.get("result") or {})
