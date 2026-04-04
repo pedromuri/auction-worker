@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v31"
+APP_VERSION = "async-v32"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -1098,20 +1098,26 @@ def choose_price_probe_track(
     weight_value: int | None = None,
     lot_hint: str | None = None,
 ) -> float | None:
-    valid_frames: list[dict] = []
-    for frame in price_frames:
-        value = frame.get("price_value")
-        if value is None:
-            continue
-        if lot_hint:
-            lot_value = str(frame.get("lot_value") or "").zfill(3)
-            if lot_value and lot_value != str(lot_hint).zfill(3):
+    def collect_valid_frames(enforce_lot_hint: bool) -> list[dict]:
+        collected: list[dict] = []
+        for frame in price_frames:
+            value = frame.get("price_value")
+            if value is None:
                 continue
-        if weight_value:
-            per_kg = value / weight_value
-            if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
-                continue
-        valid_frames.append(frame)
+            if lot_hint and enforce_lot_hint:
+                lot_value = str(frame.get("lot_value") or "").zfill(3)
+                if lot_value and lot_value != str(lot_hint).zfill(3):
+                    continue
+            if weight_value:
+                per_kg = value / weight_value
+                if not (PRICE_PROBE_PER_KG_MIN <= per_kg <= PRICE_PROBE_PER_KG_MAX):
+                    continue
+            collected.append(frame)
+        return collected
+
+    valid_frames = collect_valid_frames(enforce_lot_hint=True)
+    if not valid_frames and lot_hint:
+        valid_frames = collect_valid_frames(enforce_lot_hint=False)
 
     if not valid_frames:
         return None
@@ -1143,6 +1149,7 @@ def choose_price_probe_track(
             + (avg_frame_support * 120)
             + (avg_panel_score * 80)
             + (latest_ts / 10.0)
+            + (min(cluster_value, 8000.0) / 200.0)
         )
         clustered.append((score, cluster_value, support, unique_timestamps, avg_frame_support, latest_ts))
 
