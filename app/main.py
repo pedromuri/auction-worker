@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v32"
+APP_VERSION = "async-v33"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -53,7 +53,7 @@ PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
 # The isolated price probe works better with a shorter, earlier tail:
 # later frames are noisier while T-6s..T-3s usually contains the stable close price.
 PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0]
-PRICE_PROBE_FALLBACK_OFFSETS = [60.0, 50.0, 40.0, 30.0, 20.0, 14.0, 12.0, 10.0, 8.0]
+PRICE_PROBE_FALLBACK_OFFSETS = [60.0, 50.0, 40.0, 30.0, 20.0, 18.0, 16.0, 14.0, 12.0, 10.0, 8.0]
 PRICE_PROBE_FORWARD_OFFSETS = [-4.0, -12.0, -20.0, -30.0]
 PRICE_PROBE_TIMESTAMP_JITTERS = [0.0, 0.25, -0.25]
 PRICE_PROBE_PER_KG_MIN = 8.0
@@ -1159,6 +1159,10 @@ def choose_price_probe_track(
         if len(clustered) > 1:
             _, second_value, second_support, _, _, second_ts = clustered[1]
             if top_value > (second_value + 1000) and top_support <= second_support and top_ts <= (second_ts + 4):
+                return second_value
+            if top_value > (second_value + 1500) and top_support <= (second_support + 1) and top_ts <= (second_ts + 8):
+                return second_value
+            if second_value > (top_value + 250) and second_value <= (top_value + 800) and second_support >= (top_support - 1) and second_ts >= (top_ts - 12):
                 return second_value
         return top_value
 
