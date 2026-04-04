@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v38"
+APP_VERSION = "async-v39"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -1037,29 +1037,109 @@ def extract_price_probe_fields(
     ], candidate_scores, candidate_counts, candidate_sources)
 
     used_alt_probe = False
-    if not candidate_scores:
-        price_probe_alt_texts = ocr_price_probe_texts(price_probe_alt_crop)
-        price_probe_alt_focus_texts = ocr_price_probe_texts(price_probe_alt_focus_crop)
-        collect_candidates([
-            ("probe_alt_focus", price_probe_alt_focus_texts, 1.55),
-            ("probe_alt", price_probe_alt_texts, 1.20),
-            ("focus", price_focus_texts, 0.95),
-            ("price", price_texts, 0.65),
-        ], candidate_scores, candidate_counts, candidate_sources)
-        used_alt_probe = bool(candidate_scores)
+    price_probe_alt_texts = ocr_price_probe_texts(price_probe_alt_crop)
+    price_probe_alt_focus_texts = ocr_price_probe_texts(price_probe_alt_focus_crop)
+    alt_candidate_scores: dict[float, float] = {}
+    alt_candidate_counts: dict[float, int] = {}
+    alt_candidate_sources: dict[float, set[str]] = {}
+    collect_candidates([
+        ("probe_alt_focus", price_probe_alt_focus_texts, 1.55),
+        ("probe_alt", price_probe_alt_texts, 1.20),
+        ("focus", price_focus_texts, 0.95),
+        ("price", price_texts, 0.65),
+    ], alt_candidate_scores, alt_candidate_counts, alt_candidate_sources)
+
+    price_probe_alt2_texts = ocr_price_probe_texts(price_probe_alt2_crop)
+    price_probe_alt2_focus_texts = ocr_price_probe_texts(price_probe_alt2_focus_crop)
+    alt2_candidate_scores: dict[float, float] = {}
+    alt2_candidate_counts: dict[float, int] = {}
+    alt2_candidate_sources: dict[float, set[str]] = {}
+    collect_candidates([
+        ("probe_alt2_focus", price_probe_alt2_focus_texts, 1.45),
+        ("probe_alt2", price_probe_alt2_texts, 1.10),
+        ("probe_alt_focus", price_probe_alt_focus_texts, 1.00),
+        ("probe_alt", price_probe_alt_texts, 0.85),
+        ("focus", price_focus_texts, 0.95),
+        ("price", price_texts, 0.65),
+    ], alt2_candidate_scores, alt2_candidate_counts, alt2_candidate_sources)
+
+    def best_candidate_tuple(
+        scores: dict[float, float],
+        counts: dict[float, int],
+        sources: dict[float, set[str]],
+    ) -> tuple[float, float, int, int] | None:
+        if not scores:
+            return None
+        ranked = sorted(
+            scores.items(),
+            key=lambda item: (
+                -item[1],
+                -len(sources.get(item[0], set())),
+                -counts.get(item[0], 0),
+                item[0],
+            ),
+        )
+        value, score = ranked[0]
+        return (
+            float(value),
+            float(score),
+            int(counts.get(value, 0)),
+            len(sources.get(value, set())),
+        )
+
+    primary_best = best_candidate_tuple(candidate_scores, candidate_counts, candidate_sources)
+    alt_best = best_candidate_tuple(alt_candidate_scores, alt_candidate_counts, alt_candidate_sources)
+    alt2_best = best_candidate_tuple(alt2_candidate_scores, alt2_candidate_counts, alt2_candidate_sources)
+
+    def merge_candidates(
+        scores: dict[float, float],
+        counts: dict[float, int],
+        sources: dict[float, set[str]],
+        scale: float = 1.0,
+    ) -> None:
+        nonlocal used_alt_probe
+        if not scores:
+            return
+        used_alt_probe = True
+        for value, score in scores.items():
+            candidate_scores[value] = candidate_scores.get(value, 0.0) + (score * scale)
+            candidate_counts[value] = candidate_counts.get(value, 0) + counts.get(value, 0)
+            candidate_sources.setdefault(value, set()).update(sources.get(value, set()))
 
     if not candidate_scores:
-        price_probe_alt2_texts = ocr_price_probe_texts(price_probe_alt2_crop)
-        price_probe_alt2_focus_texts = ocr_price_probe_texts(price_probe_alt2_focus_crop)
-        collect_candidates([
-            ("probe_alt2_focus", price_probe_alt2_focus_texts, 1.45),
-            ("probe_alt2", price_probe_alt2_texts, 1.10),
-            ("probe_alt_focus", price_probe_alt_focus_texts, 1.00),
-            ("probe_alt", price_probe_alt_texts, 0.85),
-            ("focus", price_focus_texts, 0.95),
-            ("price", price_texts, 0.65),
-        ], candidate_scores, candidate_counts, candidate_sources)
-        used_alt_probe = bool(candidate_scores)
+        merge_candidates(alt_candidate_scores, alt_candidate_counts, alt_candidate_sources, scale=1.0)
+    elif primary_best and alt_best:
+        primary_value, _, primary_count, primary_source_count = primary_best
+        alt_value, alt_score, alt_count, alt_source_count = alt_best
+        if (
+            alt_value > primary_value
+            and (alt_value - primary_value) <= 900
+            and alt_count >= max(1, primary_count - 1)
+            and alt_source_count >= max(1, primary_source_count - 1)
+        ) or (
+            primary_value > (alt_value + 1400)
+            and alt_count >= primary_count
+            and alt_source_count >= primary_source_count
+            and alt_score >= 0.75
+        ):
+            merge_candidates(alt_candidate_scores, alt_candidate_counts, alt_candidate_sources, scale=0.85)
+
+    if not candidate_scores:
+        merge_candidates(alt2_candidate_scores, alt2_candidate_counts, alt2_candidate_sources, scale=1.0)
+    elif primary_best and alt2_best:
+        primary_value, _, primary_count, primary_source_count = best_candidate_tuple(candidate_scores, candidate_counts, candidate_sources) or primary_best
+        alt2_value, alt2_score, alt2_count, alt2_source_count = alt2_best
+        if (
+            alt2_value > primary_value
+            and (alt2_value - primary_value) <= 900
+            and alt2_count >= max(1, primary_count - 1)
+        ) or (
+            primary_value > (alt2_value + 1400)
+            and alt2_count >= primary_count
+            and alt2_source_count >= primary_source_count
+            and alt2_score >= 0.75
+        ):
+            merge_candidates(alt2_candidate_scores, alt2_candidate_counts, alt2_candidate_sources, scale=0.70)
 
     best_value = None
     best_support = 0
@@ -1164,6 +1244,16 @@ def choose_price_probe_track(
                 return second_value
             if second_value > (top_value + 250) and second_value <= (top_value + 800) and second_support >= (top_support - 1) and second_ts >= (top_ts - 12):
                 return second_value
+        later_lower_frames = [
+            frame for frame in ordered_frames
+            if float(frame.get("timestamp") or 0) > (top_ts + 4)
+            and float(frame.get("price_value") or 0) < (top_value - 800)
+        ]
+        later_lower_values = sorted({float(frame.get("price_value") or 0) for frame in later_lower_frames})
+        if len(later_lower_values) >= 3:
+            max_lower = later_lower_values[-1]
+            if max_lower >= max(100.0, top_value - 2800):
+                return max_lower
         return top_value
 
     valid_frames.sort(key=lambda item: float(item.get("timestamp") or 0))
