@@ -22,7 +22,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v35"
+APP_VERSION = "async-v36"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -54,7 +54,7 @@ PRE_BOUNDARY_OFFSETS = [1.5, 0.5]
 # later frames are noisier while T-6s..T-3s usually contains the stable close price.
 PRICE_PROBE_OFFSETS = [6.0, 5.0, 4.0, 3.0]
 PRICE_PROBE_FALLBACK_OFFSETS = [60.0, 50.0, 40.0, 30.0, 20.0, 18.0, 16.0, 14.0, 12.0, 10.0, 8.0]
-PRICE_PROBE_FORWARD_OFFSETS = [-4.0, -12.0, -20.0, -30.0]
+PRICE_PROBE_FORWARD_OFFSETS = [-4.0, -12.0, -20.0, -30.0, -40.0, -50.0, -60.0]
 PRICE_PROBE_TIMESTAMP_JITTERS = [0.0, 0.25, -0.25]
 PRICE_PROBE_PER_KG_MIN = 8.0
 PRICE_PROBE_PER_KG_MAX = 23.5
@@ -1164,6 +1164,25 @@ def choose_price_probe_track(
                 return second_value
             if second_value > (top_value + 250) and second_value <= (top_value + 800) and second_support >= (top_support - 1) and second_ts >= (top_ts - 12):
                 return second_value
+        rising_tail: list[dict] = []
+        for frame in reversed(ordered_frames):
+            value = float(frame["price_value"])
+            if not rising_tail:
+                rising_tail.append(frame)
+                continue
+            last_value = float(rising_tail[-1]["price_value"])
+            # Keep a recent monotonic staircase, but reject abrupt jumps that usually
+            # come from inflated OCR like 9200 over a visible 5200/6200 trail.
+            if value <= (last_value + 120) and (last_value - value) <= 1000:
+                rising_tail.append(frame)
+            else:
+                break
+        rising_tail = list(reversed(rising_tail))
+        if len(rising_tail) >= 3:
+            first_value = float(rising_tail[0]["price_value"])
+            last_value = float(rising_tail[-1]["price_value"])
+            if last_value >= (first_value + 300) and last_value > top_value and last_value <= (top_value + 2000):
+                return last_value
         return top_value
 
     valid_frames.sort(key=lambda item: float(item.get("timestamp") or 0))
