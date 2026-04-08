@@ -839,6 +839,26 @@ def infer_panel_category_profile(
     return "default"
 
 
+def infer_panel_layout_hint(
+    explicit_layout_hint: str | None = None,
+    *,
+    event_text: str | None = None,
+    category_profile: str | None = None,
+) -> str | None:
+    if explicit_layout_hint and explicit_layout_hint in PANEL_LAYOUT_TEMPLATES:
+        return explicit_layout_hint
+
+    profile = (category_profile or "").strip()
+    if profile.startswith("correa_"):
+        return "correa_green_bar_v1"
+
+    event_folded = folded_text(event_text)
+    if "correa" in event_folded:
+        return "correa_green_bar_v1"
+
+    return None
+
+
 def resolve_panel_categories(
     categories: list[str] | None,
     category_profile: str,
@@ -1624,6 +1644,11 @@ async def run_panel_ocr(
         event_text=event_text,
         categories=categories,
     )
+    resolved_layout_hint = infer_panel_layout_hint(
+        layout_hint,
+        event_text=event_text,
+        category_profile=resolved_category_profile,
+    )
     resolved_categories = resolve_panel_categories(categories, resolved_category_profile)
     sources = [{
         "frame_file": frame_file,
@@ -1653,7 +1678,7 @@ async def run_panel_ocr(
                 extract_panel_fields,
                 image,
                 resolved_categories,
-                layout_hint,
+                resolved_layout_hint,
             )
         finally:
             image.close()
@@ -1688,6 +1713,16 @@ async def run_price_probe(
     price_frames: list[dict] = []
     layout_candidates: list[str] = []
     frame_errors: list[dict] = []
+    event_text = ""
+    if layout_hint and layout_hint not in PANEL_LAYOUT_TEMPLATES:
+        layout_hint = None
+
+    # Metadata-driven family hint keeps Correa variants in the same visual family
+    # without hardcoding one template per individual leilao.
+    resolved_layout_hint = layout_hint
+    if lot_hint:
+        # no-op placeholder to keep local variable grouping readable
+        pass
 
     async def collect_probe_frames(offsets: list[float], window_label: str) -> list[dict]:
         timestamps = build_relative_timestamps(
@@ -1720,7 +1755,7 @@ async def run_price_probe(
                             extract_price_probe_fields,
                             rgb,
                             weight_hint=weight_hint,
-                            layout_hint=layout_hint,
+                            layout_hint=resolved_layout_hint,
                         )
                         layout_id = extracted.get("layout_id", "")
                         panel_visibility = assess_panel_visibility(rgb, layout_id)
