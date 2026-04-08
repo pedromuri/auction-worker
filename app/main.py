@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import time
 import re
+import unicodedata
 from io import BytesIO
 from collections import Counter
 from difflib import SequenceMatcher
@@ -22,7 +23,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v39"
+APP_VERSION = "async-v40"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -863,6 +864,10 @@ def resolve_panel_categories(
     categories: list[str] | None,
     category_profile: str,
 ) -> list[str]:
+    if category_profile and category_profile != "default":
+        profile_categories = PANEL_CATEGORY_PROFILES.get(category_profile)
+        if profile_categories:
+            return profile_categories
     if categories:
         return categories
     return PANEL_CATEGORY_PROFILES.get(category_profile, PANEL_CATEGORIES)
@@ -1386,11 +1391,24 @@ def choose_price_probe_track(
 
 
 def parse_lot_value(texts: list[str]) -> str:
+    candidate_scores: dict[str, int] = {}
     for text in texts:
         digits = parse_digits(text)
-        if 1 <= len(digits) <= 3:
-            return digits.zfill(3)
-    return ""
+        if not (1 <= len(digits) <= 3):
+            continue
+        normalized = digits.lstrip("0") or "0"
+        if len(normalized) > 3 or normalized == "0":
+            continue
+        candidate_scores[normalized] = candidate_scores.get(normalized, 0) + 1
+
+    if not candidate_scores:
+        return ""
+
+    best_candidate = sorted(
+        candidate_scores.items(),
+        key=lambda item: (-item[1], len(item[0]), item[0]),
+    )[0][0]
+    return best_candidate.zfill(3)
 
 
 def parse_info_value(texts: list[str]) -> dict:
@@ -1477,6 +1495,59 @@ def normalize_category(value: str, categories: list[str]) -> str:
     return candidate
 
 
+def canonical_category_value(value: str) -> str:
+    folded = folded_text(value)
+    folded = unicodedata.normalize("NFKD", folded).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def normalize_category(
+    value: str,
+    categories: list[str],
+    category_profile: str = "default",
+) -> str:
+    candidate = re.sub(r"\s+", " ", (value or "").strip())
+    if not candidate:
+        return ""
+
+    candidate_folded = canonical_category_value(candidate)
+    if not candidate_folded:
+        return ""
+
+    if category_profile == "correa_femeas_v1":
+        if "prenha" in candidate_folded:
+            return "Vaca prenha"
+        if "parida" in candidate_folded:
+            return "Vaca parida"
+        if "novilh" in candidate_folded:
+            return "Novilha"
+        if "bezer" in candidate_folded:
+            return "Bezerra femea"
+        if "anel" in candidate_folded:
+            return "Anel"
+        if "cruz" in candidate_folded or "crz" in candidate_folded or "industrial" in candidate_folded or "tricross" in candidate_folded:
+            return "Cruz industrial"
+        if "touruno" in candidate_folded or "toruno" in candidate_folded:
+            return "Cruzado"
+        if "nelore" in candidate_folded:
+            return "Nelore"
+        if "vaca" in candidate_folded or "boi" in candidate_folded or "garrote" in candidate_folded:
+            return "Vaca"
+
+    best_match = ""
+    best_score = 0.0
+    for category in categories:
+        category_folded = canonical_category_value(category)
+        score = SequenceMatcher(None, candidate_folded, category_folded).ratio()
+        if score > best_score:
+            best_match = category
+            best_score = score
+
+    if best_score >= 0.72:
+        return best_match
+    return candidate
+
+
 def format_brl(value: float | None) -> str:
     if value is None:
         return ""
@@ -1495,6 +1566,7 @@ def extract_panel_fields(
     image: Image.Image,
     categories: list[str],
     layout_hint: str | None = None,
+    category_profile: str = "default",
 ) -> dict:
     layout_id = detect_panel_layout(image, layout_hint=layout_hint)
     template = PANEL_LAYOUT_TEMPLATES[layout_id]
@@ -1547,7 +1619,7 @@ def extract_panel_fields(
     return {
         "lote": parse_lot_value(lot_texts),
         "quantidade_animais": info_values["quantidade_animais"],
-        "categoria_animal": normalize_category(info_values["categoria_animal"], categories),
+        "categoria_animal": normalize_category(info_values["categoria_animal"], categories, category_profile),
         "peso_medio_kg": info_values["peso_medio_kg"],
         "preco_compra_rs": format_brl(price),
         "preco_kg_rs": format_decimal_brl(price_per_kg),
@@ -1679,6 +1751,7 @@ async def run_panel_ocr(
                 image,
                 resolved_categories,
                 resolved_layout_hint,
+                resolved_category_profile,
             )
         finally:
             image.close()
