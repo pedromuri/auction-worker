@@ -1390,7 +1390,7 @@ def choose_price_probe_track(
     return scored[0][1] if scored else None
 
 
-def parse_lot_value(texts: list[str]) -> str:
+def parse_lot_value(texts: list[str], category_profile: str = "default") -> str:
     candidate_scores: dict[str, int] = {}
     for text in texts:
         digits = parse_digits(text)
@@ -1404,10 +1404,30 @@ def parse_lot_value(texts: list[str]) -> str:
     if not candidate_scores:
         return ""
 
-    best_candidate = sorted(
+    ranked_candidates = sorted(
         candidate_scores.items(),
         key=lambda item: (-item[1], len(item[0]), item[0]),
-    )[0][0]
+    )
+    best_candidate, best_score = ranked_candidates[0]
+
+    # In Correa female lots, OCR sometimes prepends a noisy leading digit
+    # (for example 505 instead of 05). Prefer the shorter suffix variant when
+    # it has nearly the same support across OCR variants.
+    if category_profile == "correa_femeas_v1" and len(best_candidate) == 3:
+        suffix_options = []
+        for candidate, score in ranked_candidates[1:]:
+            if len(candidate) >= len(best_candidate):
+                continue
+            if best_candidate.endswith(candidate.zfill(2)) or best_candidate.endswith(candidate):
+                suffix_options.append((candidate, score))
+        if suffix_options:
+            suffix_candidate, suffix_score = sorted(
+                suffix_options,
+                key=lambda item: (-item[1], len(item[0]), item[0]),
+            )[0]
+            if suffix_score >= (best_score - 1):
+                return suffix_candidate.zfill(3)
+
     return best_candidate.zfill(3)
 
 
@@ -1616,14 +1636,16 @@ def extract_panel_fields(
     weight_value = int(info_values["peso_medio_kg"]) if info_values["peso_medio_kg"].isdigit() else None
     price_per_kg = round(price / weight_value, 2) if price and weight_value else None
 
+    lote_value = parse_lot_value(lot_texts, category_profile=category_profile)
+
     return {
-        "lote": parse_lot_value(lot_texts),
+        "lote": lote_value,
         "quantidade_animais": info_values["quantidade_animais"],
         "categoria_animal": normalize_category(info_values["categoria_animal"], categories, category_profile),
         "peso_medio_kg": info_values["peso_medio_kg"],
         "preco_compra_rs": format_brl(price),
         "preco_kg_rs": format_decimal_brl(price_per_kg),
-        "is_visual_candidate": bool(parse_lot_value(lot_texts)),
+        "is_visual_candidate": bool(lote_value),
         "frame_kind": "lot_panel_deterministic_ocr",
         "observacao": "",
         "layout_id": layout_id,
