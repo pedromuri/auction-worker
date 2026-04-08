@@ -82,6 +82,39 @@ PANEL_CATEGORIES = [
     "Cruzado",
     "Touruno",
 ]
+PANEL_CATEGORY_PROFILES = {
+    "default": PANEL_CATEGORIES,
+    "correa_femeas_v1": [
+        "Vaca",
+        "Novilha",
+        "Bezerra fêmea",
+        "Vaca prenha",
+        "Vaca parida",
+        "Cruz industrial",
+        "Anel",
+        "Cruzado",
+        "Nelore",
+    ],
+    "correa_machos_v1": [
+        "Bezerro",
+        "Garrote",
+        "Boi magro",
+        "Toruno",
+        "Cruz industrial",
+        "Macho(s) Nelore",
+        "Macho(s) Crz. Ind.",
+        "Macho(s) Nelore e Crz Ind",
+        "Macho(s) Anel",
+        "Macho(s) Tricross",
+        "Macho(s) Touruno",
+        "Macho(s) Crz Ind",
+        "Macho(s) Cruzado",
+        "Anel",
+        "Cruzado",
+        "Touruno",
+        "Nelore",
+    ],
+}
 PANEL_LAYOUT_TEMPLATES = {
     "correa_green_bar_v1": {
         "lot": (0.00, 0.74, 0.17, 0.995),
@@ -165,6 +198,7 @@ class PanelOcrRequest(BaseModel):
     support_frames: list[PanelOcrSupportFrame] = []
     categories: list[str] | None = None
     layout_hint: str | None = None
+    category_profile: str | None = None
 
 
 class PanelOcrBatchItem(BaseModel):
@@ -174,6 +208,7 @@ class PanelOcrBatchItem(BaseModel):
     support_frames: list[PanelOcrSupportFrame] = []
     categories: list[str] | None = None
     layout_hint: str | None = None
+    category_profile: str | None = None
     metadata: dict | None = None
 
 
@@ -762,6 +797,55 @@ def detect_panel_layout(image: Image.Image, layout_hint: str | None = None) -> s
         return "correa_green_bar_v1"
 
     return "generic_bottom_bar_v1"
+
+
+def folded_text(value: str | None) -> str:
+    candidate = (value or "").strip().lower()
+    return (
+        candidate
+        .replace("ç", "c")
+        .replace("ă", "a")
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("ę", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ô", "o")
+        .replace("ú", "u")
+    )
+
+
+def infer_panel_category_profile(
+    explicit_profile: str | None = None,
+    event_text: str | None = None,
+    categories: list[str] | None = None,
+) -> str:
+    if explicit_profile and explicit_profile in PANEL_CATEGORY_PROFILES:
+        return explicit_profile
+
+    event_folded = folded_text(event_text)
+    if "femea" in event_folded:
+        return "correa_femeas_v1"
+    if "macho" in event_folded:
+        return "correa_machos_v1"
+
+    if categories:
+        category_folded = " ".join(folded_text(category) for category in categories)
+        if "vaca" in category_folded or "novilha" in category_folded or "femea" in category_folded:
+            return "correa_femeas_v1"
+        if "macho" in category_folded or "garrote" in category_folded or "bezerro" in category_folded:
+            return "correa_machos_v1"
+
+    return "default"
+
+
+def resolve_panel_categories(
+    categories: list[str] | None,
+    category_profile: str,
+) -> list[str]:
+    if categories:
+        return categories
+    return PANEL_CATEGORY_PROFILES.get(category_profile, PANEL_CATEGORIES)
 
 
 def region_color_fraction(
@@ -1529,8 +1613,18 @@ async def run_panel_ocr(
     support_frames: list[PanelOcrSupportFrame],
     categories: list[str] | None,
     layout_hint: str | None,
+    category_profile: str | None = None,
+    metadata: dict | None = None,
 ) -> dict:
-    resolved_categories = categories or PANEL_CATEGORIES
+    event_text = ""
+    if metadata:
+        event_text = str(metadata.get("evento") or metadata.get("Evento") or "").strip()
+    resolved_category_profile = infer_panel_category_profile(
+        explicit_profile=category_profile,
+        event_text=event_text,
+        categories=categories,
+    )
+    resolved_categories = resolve_panel_categories(categories, resolved_category_profile)
     sources = [{
         "frame_file": frame_file,
         "frame_url": frame_url,
@@ -1573,6 +1667,8 @@ async def run_panel_ocr(
         })
 
     consensus = build_ocr_consensus(frame_results)
+    consensus["category_profile"] = resolved_category_profile
+    consensus["observacao"] = f"{consensus.get('observacao', '')}; category_profile={resolved_category_profile}".strip("; ")
     consensus["version"] = APP_VERSION
     return consensus
 
@@ -2272,6 +2368,7 @@ async def frame_panel_ocr(payload: PanelOcrRequest):
             support_frames=payload.support_frames,
             categories=payload.categories,
             layout_hint=payload.layout_hint,
+            category_profile=payload.category_profile,
         )
 
     except Exception as e:
@@ -2298,6 +2395,8 @@ async def frame_panel_ocr_batch(payload: PanelOcrBatchRequest):
                     support_frames=item.support_frames,
                     categories=item.categories,
                     layout_hint=item.layout_hint,
+                    category_profile=item.category_profile,
+                    metadata=item.metadata,
                 )
                 if item.metadata:
                     consensus["metadata"] = item.metadata
