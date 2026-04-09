@@ -23,7 +23,7 @@ import pytesseract
 
 app = FastAPI(title="Auction Worker")
 
-APP_VERSION = "async-v40"
+APP_VERSION = "async-v41"
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -1676,8 +1676,30 @@ def parse_currency_field(value: str) -> float | None:
     return parse_money_number(value)
 
 
-def build_ocr_consensus(frame_results: list[dict]) -> dict:
+def post_validate_consensus_lot(
+    lot: str,
+    *,
+    category_profile: str = "default",
+) -> str:
+    if not lot:
+        return ""
+    if category_profile == "correa_femeas_v1":
+        try:
+            lot_number = int(lot)
+        except ValueError:
+            return lot
+        # In the current Correa female family, OCR sometimes hallucinates
+        # inflated 3-digit lots such as 205/505/935. Keep the family-wide
+        # validation conservative and reject these outliers from the visual
+        # consensus so they do not become false positives downstream.
+        if lot_number > 150:
+            return ""
+    return lot
+
+
+def build_ocr_consensus(frame_results: list[dict], *, category_profile: str = "default") -> dict:
     lot = choose_consensus([item["lote"] for item in frame_results])
+    lot = post_validate_consensus_lot(lot, category_profile=category_profile)
     quantity = choose_consensus([item["quantidade_animais"] for item in frame_results])
     category = choose_consensus([item["categoria_animal"] for item in frame_results])
     weight = choose_consensus([item["peso_medio_kg"] for item in frame_results])
@@ -1786,7 +1808,7 @@ async def run_panel_ocr(
             **extracted,
         })
 
-    consensus = build_ocr_consensus(frame_results)
+    consensus = build_ocr_consensus(frame_results, category_profile=resolved_category_profile)
     consensus["category_profile"] = resolved_category_profile
     consensus["observacao"] = f"{consensus.get('observacao', '')}; category_profile={resolved_category_profile}".strip("; ")
     consensus["version"] = APP_VERSION
