@@ -1436,11 +1436,17 @@ def parse_info_value(texts: list[str]) -> dict:
         "quantidade_animais": "",
         "categoria_animal": "",
         "peso_medio_kg": "",
+        "composicao_lote": "",
+        "bezerros_femeas": "",
+        "bezerros_machos": "",
+        "paridas": "",
+        "solteiras": "",
+        "prenhas": "",
         "raw": "",
     }
 
     for text in texts:
-        cleaned = text.replace("|", " ").replace("_", " ")
+        cleaned = text.replace("|", " / ").replace("_", " ")
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         quantity_match = re.search(r"^(\d{1,3})\b", cleaned)
         weight_match = re.search(r"(\d{2,4})\s*kg\b", cleaned, flags=re.IGNORECASE)
@@ -1455,17 +1461,50 @@ def parse_info_value(texts: list[str]) -> dict:
         category = category.replace("-", " ").strip(" -")
         category = re.sub(r"\s+", " ", category)
 
-        score = int(bool(quantity)) + int(bool(weight)) + int(bool(category))
+        composition = ""
+        if weight_match:
+            composition = cleaned[weight_match.end():]
+        composition = composition.strip(" -/")
+        composition = re.sub(r"\s+", " ", composition)
+
+        bezerros_femeas_match = re.search(r"\b(\d{1,2})\s*F\b", composition, flags=re.IGNORECASE)
+        bezerros_machos_match = re.search(r"\b(\d{1,2})\s*M\b", composition, flags=re.IGNORECASE)
+        paridas_match = re.search(r"\b(\d{1,2})\s*PARIDAS?\b", composition, flags=re.IGNORECASE)
+        solteiras_match = re.search(r"\b(\d{1,2})\s*SOLTEIRAS?\b", composition, flags=re.IGNORECASE)
+        prenhas_match = re.search(r"\b(\d{1,2})\s*PRENHAS?\b", composition, flags=re.IGNORECASE)
+
+        composition_fields = {
+            "composicao_lote": composition,
+            "bezerros_femeas": bezerros_femeas_match.group(1) if bezerros_femeas_match else "",
+            "bezerros_machos": bezerros_machos_match.group(1) if bezerros_machos_match else "",
+            "paridas": paridas_match.group(1) if paridas_match else "",
+            "solteiras": solteiras_match.group(1) if solteiras_match else "",
+            "prenhas": prenhas_match.group(1) if prenhas_match else "",
+        }
+
+        score = (
+            int(bool(quantity)) +
+            int(bool(weight)) +
+            int(bool(category)) +
+            int(bool(composition_fields["composicao_lote"]))
+        )
         best_score = (
             int(bool(best["quantidade_animais"])) +
             int(bool(best["peso_medio_kg"])) +
-            int(bool(best["categoria_animal"]))
+            int(bool(best["categoria_animal"])) +
+            int(bool(best["composicao_lote"]))
         )
         if score > best_score:
             best = {
                 "quantidade_animais": quantity,
                 "categoria_animal": category,
                 "peso_medio_kg": weight,
+                "composicao_lote": composition_fields["composicao_lote"],
+                "bezerros_femeas": composition_fields["bezerros_femeas"],
+                "bezerros_machos": composition_fields["bezerros_machos"],
+                "paridas": composition_fields["paridas"],
+                "solteiras": composition_fields["solteiras"],
+                "prenhas": composition_fields["prenhas"],
                 "raw": cleaned,
             }
 
@@ -1643,6 +1682,12 @@ def extract_panel_fields(
         "quantidade_animais": info_values["quantidade_animais"],
         "categoria_animal": normalize_category(info_values["categoria_animal"], categories, category_profile),
         "peso_medio_kg": info_values["peso_medio_kg"],
+        "composicao_lote": info_values["composicao_lote"],
+        "bezerros_femeas": info_values["bezerros_femeas"],
+        "bezerros_machos": info_values["bezerros_machos"],
+        "paridas": info_values["paridas"],
+        "solteiras": info_values["solteiras"],
+        "prenhas": info_values["prenhas"],
         "preco_compra_rs": format_brl(price),
         "preco_kg_rs": format_decimal_brl(price_per_kg),
         "is_visual_candidate": bool(lote_value),
@@ -1703,6 +1748,12 @@ def build_ocr_consensus(frame_results: list[dict], *, category_profile: str = "d
     quantity = choose_consensus([item["quantidade_animais"] for item in frame_results])
     category = choose_consensus([item["categoria_animal"] for item in frame_results])
     weight = choose_consensus([item["peso_medio_kg"] for item in frame_results])
+    composition = choose_consensus([item.get("composicao_lote", "") for item in frame_results])
+    bezerros_femeas = choose_consensus([item.get("bezerros_femeas", "") for item in frame_results])
+    bezerros_machos = choose_consensus([item.get("bezerros_machos", "") for item in frame_results])
+    paridas = choose_consensus([item.get("paridas", "") for item in frame_results])
+    solteiras = choose_consensus([item.get("solteiras", "") for item in frame_results])
+    prenhas = choose_consensus([item.get("prenhas", "") for item in frame_results])
 
     valid_prices: list[float] = []
     for item in frame_results:
@@ -1730,6 +1781,12 @@ def build_ocr_consensus(frame_results: list[dict], *, category_profile: str = "d
         "quantidade_animais": quantity,
         "categoria_animal": category,
         "peso_medio_kg": weight,
+        "composicao_lote": composition,
+        "bezerros_femeas": bezerros_femeas,
+        "bezerros_machos": bezerros_machos,
+        "paridas": paridas,
+        "solteiras": solteiras,
+        "prenhas": prenhas,
         "preco_compra_rs": format_brl(best_price),
         "preco_kg_rs": format_decimal_brl(price_per_kg),
         "comprador": "",
