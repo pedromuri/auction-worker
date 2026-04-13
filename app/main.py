@@ -120,7 +120,7 @@ PANEL_LAYOUT_TEMPLATES = {
     "correa_green_bar_v1": {
         "lot": (0.00, 0.74, 0.17, 0.995),
         "info": (0.15, 0.78, 0.68, 0.95),
-        "info_detail": (0.16, 0.865, 0.64, 0.95),
+        "info_detail": (0.15, 0.84, 0.72, 0.955),
         "price": (0.67, 0.75, 0.995, 0.95),
         "price_focus": (0.76, 0.75, 0.995, 0.95),
         "price_probe": (0.72, 0.745, 0.995, 0.885),
@@ -1026,6 +1026,64 @@ def extract_yellow_text_mask(image: Image.Image) -> Image.Image:
     return mask
 
 
+def extract_light_text_mask(image: Image.Image) -> Image.Image:
+    rgb = image.convert("RGB")
+    mask = Image.new("L", rgb.size, 0)
+    pixels_in = rgb.load()
+    pixels_out = mask.load()
+    width, height = rgb.size
+    for y in range(height):
+        for x in range(width):
+            red, green, blue = pixels_in[x, y]
+            is_light_text = (
+                min(red, green, blue) >= 145
+                and (max(red, green, blue) - min(red, green, blue)) <= 95
+            )
+            pixels_out[x, y] = 255 if is_light_text else 0
+    mask = mask.resize((mask.width * 4, mask.height * 4))
+    mask = mask.filter(ImageFilter.MedianFilter(size=3))
+    mask = ImageEnhance.Contrast(mask).enhance(3.0)
+    return mask
+
+
+def ocr_info_detail_texts(image: Image.Image) -> list[str]:
+    values: list[str] = []
+    configs = [
+        "--psm 7",
+        "--psm 6",
+    ]
+    for threshold in (None, 150, 180, 210):
+        prepared = enhance_for_ocr(image, threshold=threshold)
+        for config in configs:
+            try:
+                text = pytesseract.image_to_string(prepared, lang="por", config=config)
+            except pytesseract.TesseractNotFoundError as exc:
+                raise RuntimeError("Tesseract OCR não está disponível no container.") from exc
+            cleaned = " ".join((text or "").replace("\n", " ").split())
+            if cleaned:
+                values.append(cleaned)
+
+    light_mask = extract_light_text_mask(image)
+    for prepared in (light_mask, ImageOps.invert(light_mask)):
+        for config in configs:
+            try:
+                text = pytesseract.image_to_string(prepared, lang="por", config=config)
+            except pytesseract.TesseractNotFoundError as exc:
+                raise RuntimeError("Tesseract OCR não está disponível no container.") from exc
+            cleaned = " ".join((text or "").replace("\n", " ").split())
+            if cleaned:
+                values.append(cleaned)
+
+    unique: list[str] = []
+    seen = set()
+    for value in values:
+        key = value.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(value.strip())
+    return unique
+
+
 def ocr_price_probe_texts(image: Image.Image) -> list[str]:
     values: list[str] = []
     configs = [
@@ -1667,14 +1725,7 @@ def extract_panel_fields(
     )
     info_detail_texts: list[str] = []
     if info_detail_crop is not None:
-        info_detail_texts = ocr_text_variants(
-            info_detail_crop,
-            configs=[
-                "--psm 7",
-                "--psm 6",
-            ],
-            thresholds=[None, 170, 200],
-        )
+        info_detail_texts = ocr_info_detail_texts(info_detail_crop)
     price_texts = ocr_text_variants(
         price_crop,
         configs=[
