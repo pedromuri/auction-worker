@@ -183,6 +183,8 @@ class FrameBoundaryRequest(BaseModel):
     focus_top: float = 0.10
     focus_right: float = 0.98
     focus_bottom: float = 0.90
+    include_support_bundle: bool = True
+    include_frames: bool = True
 
 
 class PanelOcrSupportFrame(BaseModel):
@@ -2626,22 +2628,28 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
         enriched_candidates = []
         for candidate in boundary_candidates:
             enriched = dict(candidate)
-            try:
-                support_bundle = await asyncio.to_thread(
-                    build_support_bundle,
-                    video_path=str(video_path),
-                    boundary_timestamp=float(candidate["boundary_timestamp"]),
-                    start_time=float(payload.start_time or 0),
-                    request_base_url=request_base_url,
-                )
-                enriched.update(support_bundle)
-                enriched["analysis_mode"] = "pre_boundary_montage"
-                enriched["support_frame_count"] = len(support_bundle["support_frames"])
-            except Exception as e:
-                enriched["analysis_mode"] = "single_frame_fallback"
+            if payload.include_support_bundle:
+                try:
+                    support_bundle = await asyncio.to_thread(
+                        build_support_bundle,
+                        video_path=str(video_path),
+                        boundary_timestamp=float(candidate["boundary_timestamp"]),
+                        start_time=float(payload.start_time or 0),
+                        request_base_url=request_base_url,
+                    )
+                    enriched.update(support_bundle)
+                    enriched["analysis_mode"] = "pre_boundary_montage"
+                    enriched["support_frame_count"] = len(support_bundle["support_frames"])
+                except Exception as e:
+                    enriched["analysis_mode"] = "single_frame_fallback"
+                    enriched["support_frames"] = []
+                    enriched["support_frame_count"] = 0
+                    enriched["support_generation_error"] = str(e)
+            else:
+                enriched["analysis_mode"] = "single_frame_boundary_scan"
                 enriched["support_frames"] = []
                 enriched["support_frame_count"] = 0
-                enriched["support_generation_error"] = str(e)
+                enriched["analysis_offsets_seconds"] = []
             enriched_candidates.append(enriched)
 
         return {
@@ -2653,7 +2661,7 @@ async def frame_boundaries(payload: FrameBoundaryRequest, request: Request):
             "sampled_frames": len(scanned_frames),
             "boundary_candidates": len(enriched_candidates),
             "candidates": enriched_candidates,
-            "frames": scanned_frames,
+            "frames": scanned_frames if payload.include_frames else [],
             "cached_video": video_path.name,
             "version": APP_VERSION,
         }
