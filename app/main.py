@@ -120,6 +120,7 @@ PANEL_LAYOUT_TEMPLATES = {
     "correa_green_bar_v1": {
         "lot": (0.00, 0.74, 0.17, 0.995),
         "info": (0.15, 0.78, 0.68, 0.95),
+        "info_detail": (0.16, 0.865, 0.64, 0.95),
         "price": (0.67, 0.75, 0.995, 0.95),
         "price_focus": (0.76, 0.75, 0.995, 0.95),
         "price_probe": (0.72, 0.745, 0.995, 0.885),
@@ -1467,6 +1468,18 @@ def parse_info_value(texts: list[str]) -> dict:
         composition = composition.strip(" -/")
         composition = re.sub(r"\s+", " ", composition)
 
+        standalone_composition = (
+            not composition
+            and not quantity
+            and not weight
+            and bool(
+                re.search(r"\bPARIDAS?\b|\bSOLTEIRAS?\b|\bPRENHAS?\b", cleaned, flags=re.IGNORECASE)
+                or re.search(r"\b\d{1,2}\s*[FM]\b", cleaned, flags=re.IGNORECASE)
+            )
+        )
+        if standalone_composition:
+            composition = cleaned
+
         bezerros_femeas_match = re.search(r"\b(\d{1,2})\s*F\b", composition, flags=re.IGNORECASE)
         bezerros_machos_match = re.search(r"\b(\d{1,2})\s*M\b", composition, flags=re.IGNORECASE)
         paridas_match = re.search(r"\b(\d{1,2})\s*PARIDAS?\b", composition, flags=re.IGNORECASE)
@@ -1632,6 +1645,7 @@ def extract_panel_fields(
 
     lot_crop = crop_by_ratio(image, *template["lot"])
     info_crop = crop_by_ratio(image, *template["info"])
+    info_detail_crop = crop_by_ratio(image, *template["info_detail"]) if template.get("info_detail") else None
     price_crop = crop_by_ratio(image, *template["price"])
     price_focus_crop = crop_by_ratio(image, *template["price_focus"])
 
@@ -1651,6 +1665,16 @@ def extract_panel_fields(
         ],
         thresholds=[None, 180, 210],
     )
+    info_detail_texts: list[str] = []
+    if info_detail_crop is not None:
+        info_detail_texts = ocr_text_variants(
+            info_detail_crop,
+            configs=[
+                "--psm 7",
+                "--psm 6",
+            ],
+            thresholds=[None, 170, 200],
+        )
     price_texts = ocr_text_variants(
         price_crop,
         configs=[
@@ -1669,6 +1693,17 @@ def extract_panel_fields(
     )
 
     info_values = parse_info_value(info_texts)
+    info_detail_values = parse_info_value(info_detail_texts)
+    for field in (
+        "composicao_lote",
+        "bezerros_femeas",
+        "bezerros_machos",
+        "paridas",
+        "solteiras",
+        "prenhas",
+    ):
+        if info_detail_values.get(field):
+            info_values[field] = info_detail_values[field]
     price_values = [parse_money_number(text) for text in (price_focus_texts + price_texts)]
     price_values = [value for value in price_values if value is not None]
     price = max(price_values) if price_values else None
