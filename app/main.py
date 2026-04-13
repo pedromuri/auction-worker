@@ -1784,6 +1784,7 @@ def extract_panel_fields(
             "layout_id": layout_id,
             "lot_texts": lot_texts[:3],
             "info_texts": info_texts[:3],
+            "info_detail_texts": info_detail_texts[:5],
             "price_texts": price_texts[:3],
             "price_focus_texts": price_focus_texts[:3],
         },
@@ -1849,6 +1850,17 @@ def build_ocr_consensus(frame_results: list[dict], *, category_profile: str = "d
         valid_prices.append(amount)
     best_price = max(valid_prices) if valid_prices else None
     layout_id = choose_consensus([item.get("layout_id", "") for item in frame_results])
+    info_detail_debug: list[str] = []
+    for item in frame_results:
+        debug_payload = item.get("_ocr_debug") or {}
+        for value in debug_payload.get("info_detail_texts", [])[:3]:
+            cleaned = " ".join(str(value or "").split()).strip()
+            if cleaned and cleaned not in info_detail_debug:
+                info_detail_debug.append(cleaned)
+            if len(info_detail_debug) >= 3:
+                break
+        if len(info_detail_debug) >= 3:
+            break
 
     weight_value = int(weight) if weight.isdigit() else None
     price_per_kg = round(best_price / weight_value, 2) if best_price and weight_value else None
@@ -1878,7 +1890,14 @@ def build_ocr_consensus(frame_results: list[dict], *, category_profile: str = "d
         "comprador": "",
         "regiao_destino": "",
         "confidence": confidence,
-        "observacao": f"ocr_consensus_frames={len(frame_results)}; layout_id={layout_id or 'desconhecido'}",
+        "observacao": (
+            f"ocr_consensus_frames={len(frame_results)}; layout_id={layout_id or 'desconhecido'}"
+            + (
+                f"; info_detail_debug={' | '.join(info_detail_debug)}"
+                if info_detail_debug and not composition
+                else ""
+            )
+        ),
         "layout_id": layout_id,
         "frame_results": frame_results,
     }
