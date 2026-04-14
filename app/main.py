@@ -1069,12 +1069,20 @@ def ocr_info_detail_texts(image: Image.Image) -> list[str]:
     # Crop away the phone numbers and push a stronger OCR pass focused on
     # digits, separators and short herd-composition tokens.
     left_focus = image.crop((0, 0, max(1, int(image.width * 0.74)), image.height))
-    focused = ImageOps.grayscale(left_focus)
+    composition_focus = left_focus.crop(
+        (
+            0,
+            int(left_focus.height * 0.18),
+            left_focus.width,
+            left_focus.height,
+        )
+    )
+    focused = ImageOps.grayscale(composition_focus)
     focused = ImageOps.autocontrast(focused)
-    focused = focused.resize((focused.width * 6, focused.height * 6))
+    focused = focused.resize((focused.width * 8, focused.height * 8))
     focused = focused.filter(ImageFilter.MedianFilter(size=3))
-    focused = ImageEnhance.Contrast(focused).enhance(4.5)
-    focused = ImageEnhance.Sharpness(focused).enhance(2.8)
+    focused = ImageEnhance.Contrast(focused).enhance(5.2)
+    focused = ImageEnhance.Sharpness(focused).enhance(3.2)
     focused_configs = [
         "--psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/-",
         "--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/-",
