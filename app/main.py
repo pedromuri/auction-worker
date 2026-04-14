@@ -1065,6 +1065,32 @@ def ocr_info_detail_texts(image: Image.Image) -> list[str]:
             if cleaned:
                 values.append(cleaned)
 
+    # Composition text sits on the left side of the second line.
+    # Crop away the phone numbers and push a stronger OCR pass focused on
+    # digits, separators and short herd-composition tokens.
+    left_focus = image.crop((0, 0, max(1, int(image.width * 0.74)), image.height))
+    focused = ImageOps.grayscale(left_focus)
+    focused = ImageOps.autocontrast(focused)
+    focused = focused.resize((focused.width * 6, focused.height * 6))
+    focused = focused.filter(ImageFilter.MedianFilter(size=3))
+    focused = ImageEnhance.Contrast(focused).enhance(4.5)
+    focused = ImageEnhance.Sharpness(focused).enhance(2.8)
+    focused_configs = [
+        "--psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/ -",
+        "--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/ -",
+    ]
+    for threshold in (110, 135, 160, 185, 210):
+        binary = focused.point(lambda p, t=threshold: 255 if p >= t else 0)
+        for prepared in (binary, ImageOps.invert(binary)):
+            for config in focused_configs:
+                try:
+                    text = pytesseract.image_to_string(prepared, lang="por", config=config)
+                except pytesseract.TesseractNotFoundError as exc:
+                    raise RuntimeError("Tesseract OCR nÃ£o estÃ¡ disponÃ­vel no container.") from exc
+                cleaned = " ".join((text or "").replace("\n", " ").split())
+                if cleaned:
+                    values.append(cleaned)
+
     light_mask = extract_light_text_mask(image)
     for prepared in (light_mask, ImageOps.invert(light_mask)):
         for config in configs:
