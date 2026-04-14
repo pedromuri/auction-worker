@@ -1076,8 +1076,8 @@ def ocr_info_detail_texts(image: Image.Image) -> list[str]:
     focused = ImageEnhance.Contrast(focused).enhance(4.5)
     focused = ImageEnhance.Sharpness(focused).enhance(2.8)
     focused_configs = [
-        "--psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/ -",
-        "--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/ -",
+        "--psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/-",
+        "--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/-",
     ]
     for threshold in (110, 135, 160, 185, 210):
         binary = focused.point(lambda p, t=threshold: 255 if p >= t else 0)
