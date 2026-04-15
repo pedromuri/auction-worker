@@ -120,7 +120,7 @@ PANEL_LAYOUT_TEMPLATES = {
     "correa_green_bar_v1": {
         "lot": (0.00, 0.74, 0.17, 0.995),
         "info": (0.15, 0.78, 0.68, 0.95),
-        "info_detail": (0.16, 0.892, 0.47, 0.962),
+        "info_detail": (0.10, 0.925, 0.50, 0.992),
         "price": (0.67, 0.75, 0.995, 0.95),
         "price_focus": (0.76, 0.75, 0.995, 0.95),
         "price_probe": (0.72, 0.745, 0.995, 0.885),
@@ -1065,18 +1065,10 @@ def ocr_info_detail_texts(image: Image.Image) -> list[str]:
             if cleaned:
                 values.append(cleaned)
 
-    # Composition text sits on the left side of the second line.
-    # Crop away the phone numbers and push a stronger OCR pass focused on
-    # digits, separators and short herd-composition tokens.
-    left_focus = image.crop((0, 0, max(1, int(image.width * 0.74)), image.height))
-    composition_focus = left_focus.crop(
-        (
-            0,
-            int(left_focus.height * 0.18),
-            left_focus.width,
-            left_focus.height,
-        )
-    )
+    # The layout crop is already narrowed to the lower-left composition band.
+    # Keep the focused pass on that band so short values such as "01 M" do not
+    # get cropped away before OCR.
+    composition_focus = image
     focused = ImageOps.grayscale(composition_focus)
     focused = ImageOps.autocontrast(focused)
     focused = focused.resize((focused.width * 8, focused.height * 8))
